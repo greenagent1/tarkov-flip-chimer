@@ -1,0 +1,13 @@
+# Personal config — contains your API key
+config.ini
+
+# Windows artifacts
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.suo
+*.user
+.claude/
