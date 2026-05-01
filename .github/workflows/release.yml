@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build zip
+        run: |
+          zip tarkov-flip-chimer.zip \
+            Check-TarkovPrices.ps1 \
+            run.bat \
+            config.example.ini \
+            chime.wav \
+            README.md \
+            README.ru.md \
+            how-to-get-api-key.png \
+            where-to-get-item-name.png
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes 2>/dev/null || true
+          git tag -f latest
+          git push -f origin latest
+          gh release create latest tarkov-flip-chimer.zip \
+            --title "Latest" \
+            --notes "Latest build from main."
