@@ -9,27 +9,7 @@ public class WinAudio {
     [DllImport("winmm.dll")] public static extern int waveOutGetVolume(IntPtr h, out uint vol);
     [DllImport("winmm.dll")] public static extern int waveOutSetVolume(IntPtr h, uint vol);
 }
-public class WinConsole {
-    [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
-    [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
-    [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
-}
 '@
-
-function Disable-ConsoleQuickEdit {
-    try {
-        $STD_INPUT_HANDLE      = -10
-        $ENABLE_QUICK_EDIT     = 0x0040
-        $ENABLE_EXTENDED_FLAGS = 0x0080
-        $h = [WinConsole]::GetStdHandle($STD_INPUT_HANDLE)
-        if ($h -eq [IntPtr]::Zero -or $h -eq [IntPtr]-1) { return }
-        $mode = 0
-        if ([WinConsole]::GetConsoleMode($h, [ref]$mode)) {
-            $newMode = ($mode -band -bnot $ENABLE_QUICK_EDIT) -bor $ENABLE_EXTENDED_FLAGS
-            [WinConsole]::SetConsoleMode($h, $newMode) | Out-Null
-        }
-    } catch {}
-}
 
 function Play-SoundWithVolume {
     param([string]$FilePath, [int]$Volume)
@@ -280,8 +260,6 @@ try {
     [Console]::WindowHeight = $h
 } catch {}
 
-Disable-ConsoleQuickEdit
-
 $lastAlertedPrice = @{}
 $lastPrices       = @{}
 
@@ -413,9 +391,10 @@ try {
 
                 # ── colors ───────────────────────────────────────────────────────
 
-                $priceColor  = if ($triggered -or $changed) { 'Yellow' } else { 'Cyan' }
-                $labelColor  = if ($triggered) { $bsColor  } else { 'Gray' }
-                $targetColor = if ($triggered) { 'Yellow' } else { 'DarkGray' }
+                $priceColor   = if ($triggered) { 'Yellow' } else { 'Cyan' }
+                $labelColor   = if ($triggered) { $bsColor  } else { 'Gray' }
+                $targetColor  = if ($triggered) { 'Yellow' } else { 'DarkGray' }
+                $updatedColor = if ($changed)   { 'Yellow' } else { 'DarkGray' }
 
                 $diffColor = if ($triggered) {
                     'Yellow'
@@ -441,6 +420,7 @@ try {
                     avg24h       = $avg24h
                     avg7d        = $avg7d
                     updatedAgo   = $updatedAgo
+                    updatedColor = $updatedColor
                     source       = $apiItem.source
                     triggered    = $triggered
                 })
@@ -511,7 +491,7 @@ try {
                 wh ("{0,$wAvg}" -f (Format-Price $r.avg7d)) DarkGray -NoNewline
                 wh " $rub   " DarkGray -NoNewline
             }
-            wh ("{0,-$wUpd}" -f $r.updatedAgo) DarkGray -NoNewline
+            wh ("{0,-$wUpd}" -f $r.updatedAgo) $r.updatedColor -NoNewline
             if (-not $useFree) {
                 $srcMark = if ($r.source -eq 'free') { '*' } else { ' ' }
                 wh " $srcMark" DarkGray -NoNewline
