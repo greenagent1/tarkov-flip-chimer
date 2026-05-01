@@ -9,7 +9,27 @@ public class WinAudio {
     [DllImport("winmm.dll")] public static extern int waveOutGetVolume(IntPtr h, out uint vol);
     [DllImport("winmm.dll")] public static extern int waveOutSetVolume(IntPtr h, uint vol);
 }
+public class WinConsole {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+}
 '@
+
+function Disable-ConsoleQuickEdit {
+    try {
+        $STD_INPUT_HANDLE      = -10
+        $ENABLE_QUICK_EDIT     = 0x0040
+        $ENABLE_EXTENDED_FLAGS = 0x0080
+        $h = [WinConsole]::GetStdHandle($STD_INPUT_HANDLE)
+        if ($h -eq [IntPtr]::Zero -or $h -eq [IntPtr]-1) { return }
+        $mode = 0
+        if ([WinConsole]::GetConsoleMode($h, [ref]$mode)) {
+            $newMode = ($mode -band -bnot $ENABLE_QUICK_EDIT) -bor $ENABLE_EXTENDED_FLAGS
+            [WinConsole]::SetConsoleMode($h, $newMode) | Out-Null
+        }
+    } catch {}
+}
 
 function Play-SoundWithVolume {
     param([string]$FilePath, [int]$Volume)
@@ -90,6 +110,89 @@ function Get-TarkovItemsAll {
     catch {
         Write-Warning "  Bulk API error: $_"
         return $null
+    }
+}
+
+function Get-TarkovItemsAllFree {
+    $body = @{ query = '{ items { name lastLowPrice avg24hPrice updated } }' } | ConvertTo-Json
+    try {
+        $r = Invoke-RestMethod -Uri 'https://api.tarkov.dev/graphql' -Method Post `
+            -ContentType 'application/json' -Body $body -ErrorAction Stop
+        $items = $r.data.items
+        if (-not $items) { return $null }
+        return $items | ForEach-Object {
+            [PSCustomObject]@{
+                name          = $_.name
+                price         = [long]$_.lastLowPrice
+                avg24hPrice   = [long]$_.avg24hPrice
+                avg7daysPrice = 0L
+                updated       = $_.updated
+            }
+        }
+    }
+    catch {
+        Write-Warning "  Free bulk API error: $_"
+        return $null
+    }
+}
+
+function ConvertTo-UpdatedDateTime {
+    param($UpdatedField)
+    if (-not $UpdatedField) { return $null }
+    if ($UpdatedField -is [datetime]) { return $UpdatedField.ToUniversalTime() }
+    $dt = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor `
+              [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([datetime]::TryParse([string]$UpdatedField,
+            [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dt)) {
+        return $dt
+    }
+    return $null
+}
+
+function Merge-PriceSources {
+    param($PaidItem, $FreeItem)
+    if ($null -eq $PaidItem -and $null -eq $FreeItem) { return $null }
+    if ($null -eq $FreeItem) {
+        return [PSCustomObject]@{
+            name          = $PaidItem.name
+            price         = [long]$PaidItem.price
+            avg24hPrice   = [long]$PaidItem.avg24hPrice
+            avg7daysPrice = [long]$PaidItem.avg7daysPrice
+            updated       = $PaidItem.updated
+            source        = 'paid'
+        }
+    }
+    if ($null -eq $PaidItem) {
+        return [PSCustomObject]@{
+            name          = $FreeItem.name
+            price         = [long]$FreeItem.price
+            avg24hPrice   = [long]$FreeItem.avg24hPrice
+            avg7daysPrice = 0L
+            updated       = $FreeItem.updated
+            source        = 'free'
+        }
+    }
+    $paidUpd = ConvertTo-UpdatedDateTime $PaidItem.updated
+    $freeUpd = ConvertTo-UpdatedDateTime $FreeItem.updated
+    $freeIsFresher = ($null -ne $freeUpd) -and (($null -eq $paidUpd) -or ($freeUpd -gt $paidUpd))
+    if ($freeIsFresher) {
+        return [PSCustomObject]@{
+            name          = $PaidItem.name
+            price         = [long]$FreeItem.price
+            avg24hPrice   = [long]$FreeItem.avg24hPrice
+            avg7daysPrice = [long]$PaidItem.avg7daysPrice
+            updated       = $FreeItem.updated
+            source        = 'free'
+        }
+    }
+    return [PSCustomObject]@{
+        name          = $PaidItem.name
+        price         = [long]$PaidItem.price
+        avg24hPrice   = [long]$PaidItem.avg24hPrice
+        avg7daysPrice = [long]$PaidItem.avg7daysPrice
+        updated       = $PaidItem.updated
+        source        = 'paid'
     }
 }
 
@@ -177,7 +280,10 @@ try {
     [Console]::WindowHeight = $h
 } catch {}
 
+Disable-ConsoleQuickEdit
+
 $lastAlertedPrice = @{}
+$lastPrices       = @{}
 
 # column widths
 $wLabel  = 20
@@ -190,17 +296,190 @@ $wTarget = 12
 # ─── main loop ────────────────────────────────────────────────────────────────
 try {
     while ($true) {
-        [Console]::Clear()
         $timestamp   = Get-Date -Format 'HH:mm:ss'
         $alerts      = @()   # array of @{Label;Direction}
         $freshAlerts = @()
+        $rows        = New-Object System.Collections.Generic.List[object]
+        $fetchError  = $null
 
-        $apiLabel = if ($useFree) { 'tarkov.dev (free)' } else { 'tarkov-market.app' }
+        $apiLabel = if ($useFree) { 'tarkov.dev (free)' } else { 'tarkov-market.app + tarkov.dev' }
+
+        # ── compute phase: fetch + per-section work, no console output ────
+        $allItems   = $null
+        $freeByName = @{}
+        if (-not $useFree) {
+            $allItems = Get-TarkovItemsAll -ApiKey $apiKey
+            if ($null -eq $allItems) {
+                $fetchError = 'bulk fetch failed, retrying next cycle'
+            }
+            else {
+                $allItemsFree = Get-TarkovItemsAllFree
+                if ($allItemsFree) {
+                    foreach ($f in $allItemsFree) {
+                        if ($f.name) { $freeByName[$f.name.ToLower()] = $f }
+                    }
+                }
+            }
+        }
+
+        if (-not $fetchError) {
+            foreach ($section in $itemSections) {
+                $cfg       = $ini[$section]
+                $label     = $section -replace '^Item\.', ''
+                $query     = $cfg['query']
+                $avgSource = if ($cfg['avgSource']) { $cfg['avgSource'] } else { 'avg7d' }
+                if ($useFree -and $avgSource -eq 'avg7d') { $avgSource = 'avg24h' }
+                $alertVal  = $cfg['alert']
+
+                if (-not $query -or -not $alertVal) {
+                    Write-Warning "  [$section] missing 'query' or 'alert' -- skipping"
+                    continue
+                }
+
+                if ($alertVal -match '^([BSbs])(.+)$') {
+                    $direction = $Matches[1].ToUpper(); $alertVal = $Matches[2]
+                }
+                else { $direction = 'B' }
+
+                $bsColor = if ($direction -eq 'B') { 'Green' } else { 'Red' }
+
+                if ($useFree) {
+                    $apiItems = Get-TarkovItemFree -Query $query
+                }
+                else {
+                    $paidMatches = Find-TarkovItemLocal -AllItems $allItems -Query $query
+                    if ($paidMatches) {
+                        $apiItems = @($paidMatches | ForEach-Object {
+                            $key   = if ($_.name) { $_.name.ToLower() } else { $null }
+                            $free  = if ($key -and $freeByName.ContainsKey($key)) { $freeByName[$key] } else { $null }
+                            Merge-PriceSources -PaidItem $_ -FreeItem $free
+                        })
+                    }
+                    else { $apiItems = $null }
+                }
+                if (-not $apiItems) { continue }
+
+                $usedVal = $cfg['used']
+                if ($usedVal -and $usedVal.ToLower() -eq 'yes') {
+                    $apiItem = $apiItems | Sort-Object { [long]$_.price } | Select-Object -First 1
+                }
+                else {
+                    $apiItem = $apiItems | Sort-Object { [long]$_.price } -Descending | Select-Object -First 1
+                }
+
+                $currentPrice = [long]$apiItem.price
+                $updatedAgo   = Format-UpdatedAgo $apiItem.updated
+
+                $prevPrice = $lastPrices[$section]
+                $changed   = ($null -ne $prevPrice) -and ($prevPrice -ne $currentPrice)
+                $lastPrices[$section] = $currentPrice
+
+                $avg24h = [long]$apiItem.avg24hPrice
+                $avg7d  = [long]$apiItem.avg7daysPrice
+
+                $refAvg = $null
+                if     ($avgSource -eq 'avg24h')   { $refAvg = $avg24h }
+                elseif ($avgSource -eq 'avg7d')    { $refAvg = $avg7d }
+                elseif ($avgSource -match '^\d+$') { $refAvg = [long]$avgSource }
+
+                $diffVal   = if ($refAvg -and $refAvg -gt 0) { ($currentPrice - $refAvg) / $refAvg * 100.0 } else { $null }
+                $diffLabel = if ($null -ne $diffVal)         { '{0:+0.0;-0.0}%' -f $diffVal }                else { '' }
+
+                $isPercent   = $alertVal -match '^(\d+(?:\.\d+)?)%$'
+                $triggered   = $false
+                $targetPrice = $null
+
+                if ($isPercent) {
+                    $pct = [double]$Matches[1]
+                    if ($direction -eq 'B') {
+                        $targetPrice = [long]($refAvg * (1.0 - $pct / 100.0))
+                        $triggered   = $currentPrice -lt $targetPrice
+                    }
+                    else {
+                        $targetPrice = [long]($refAvg * (1.0 + $pct / 100.0))
+                        $triggered   = $currentPrice -gt $targetPrice
+                    }
+                }
+                else {
+                    $targetPrice = [long]$alertVal
+                    if ($direction -eq 'B') { $triggered = $currentPrice -lt $targetPrice }
+                    else                    { $triggered = $currentPrice -gt $targetPrice }
+                }
+
+                $targetOverride = $cfg['target']
+                if ($targetOverride -and $targetOverride -match '^\d+$') {
+                    $targetPrice = [long]$targetOverride
+                }
+
+                # ── colors ───────────────────────────────────────────────────────
+
+                $priceColor  = if ($triggered -or $changed) { 'Yellow' } else { 'Cyan' }
+                $labelColor  = if ($triggered) { $bsColor  } else { 'Gray' }
+                $targetColor = if ($triggered) { 'Yellow' } else { 'DarkGray' }
+
+                $diffColor = if ($triggered) {
+                    'Yellow'
+                } elseif ($null -eq $diffVal) {
+                    'DarkGray'
+                } elseif ($direction -eq 'B') {
+                    if   ($diffVal -lt 0) { 'Green' } elseif ($diffVal -gt 0) { 'Red' } else { 'Gray' }
+                } else {
+                    if   ($diffVal -gt 0) { 'Green' } elseif ($diffVal -lt 0) { 'Red' } else { 'Gray' }
+                }
+
+                $rows.Add([PSCustomObject]@{
+                    direction    = $direction
+                    bsColor      = $bsColor
+                    label        = $label
+                    labelColor   = $labelColor
+                    currentPrice = $currentPrice
+                    priceColor   = $priceColor
+                    targetPrice  = $targetPrice
+                    targetColor  = $targetColor
+                    diffLabel    = $diffLabel
+                    diffColor    = $diffColor
+                    avg24h       = $avg24h
+                    avg7d        = $avg7d
+                    updatedAgo   = $updatedAgo
+                    source       = $apiItem.source
+                    triggered    = $triggered
+                })
+
+                # ── alert bookkeeping ────────────────────────────────────────────
+                if ($triggered) {
+                    $prev = $lastAlertedPrice[$section]
+                    if ($null -eq $prev) {
+                        $alerts += @{ Label = $label; Direction = $direction }
+                        $freshAlerts += $label
+                        $lastAlertedPrice[$section] = $currentPrice
+                    }
+                    elseif ($currentPrice -ne $prev) {
+                        $alerts += @{ Label = $label; Direction = $direction }
+                        $lastAlertedPrice[$section] = $currentPrice
+                    }
+                    else {
+                        $alerts += @{ Label = $label; Direction = $direction }
+                    }
+                }
+                else { $lastAlertedPrice.Remove($section) }
+            }
+        }
+
+        # ── render phase: clear screen, print everything in one burst ───
+        [Console]::Clear()
         wh "Tarkov Price Alert | $apiLabel | $($itemSections.Count) items | every ${checkIntervalSec}s | Ctrl+C to stop" DarkGray
 
         $mid = " $timestamp "
         $sepW = if ($useFree) { 46 } else { 54 }
         wh (($dash * $sepW) + $mid + ($dash * $sepW)) DarkGray
+
+        if ($fetchError) {
+            Write-Host ""
+            wh "  $fetchError" DarkGray
+            Start-Sleep -Seconds $checkIntervalSec
+            continue
+        }
+
         if ($useFree) {
             wh ("     {0,-$wLabel}  {1,$wPrice}     {2,$wTarget}     {3,$wDiff}    {4,$wAvg}     {5}" -f `
                 'Item', 'Price', 'Target', 'Diff', 'avg24h', 'Updated') DarkGray
@@ -209,150 +488,36 @@ try {
                 'Item', 'Price', 'Target', 'Diff', 'avg24h', 'avg7d', 'Updated') DarkGray
         }
 
-        $allItems = $null
-        if (-not $useFree) {
-            $allItems = Get-TarkovItemsAll -ApiKey $apiKey
-            if ($null -eq $allItems) {
-                Write-Host ""
-                wh "  bulk fetch failed, retrying next cycle" DarkGray
-                Start-Sleep -Seconds $checkIntervalSec
-                continue
-            }
-        }
-
-        foreach ($section in $itemSections) {
-            $cfg       = $ini[$section]
-            $label     = $section -replace '^Item\.', ''
-            $query     = $cfg['query']
-            $avgSource = if ($cfg['avgSource']) { $cfg['avgSource'] } else { 'avg7d' }
-            if ($useFree -and $avgSource -eq 'avg7d') { $avgSource = 'avg24h' }
-            $alertVal  = $cfg['alert']
-
-            if (-not $query -or -not $alertVal) {
-                Write-Warning "  [$section] missing 'query' or 'alert' -- skipping"
-                continue
-            }
-
-            if ($alertVal -match '^([BSbs])(.+)$') {
-                $direction = $Matches[1].ToUpper(); $alertVal = $Matches[2]
-            }
-            else { $direction = 'B' }
-
-            $bsColor = if ($direction -eq 'B') { 'Green' } else { 'Red' }
-
-            $apiItems = if ($useFree) { Get-TarkovItemFree -Query $query } `
-                        else         { Find-TarkovItemLocal -AllItems $allItems -Query $query }
-            if (-not $apiItems) { continue }
-
-            $usedVal = $cfg['used']
-            if ($usedVal -and $usedVal.ToLower() -eq 'yes') {
-                $apiItem = $apiItems | Sort-Object { [long]$_.price } | Select-Object -First 1
-            }
-            else {
-                $apiItem = $apiItems | Sort-Object { [long]$_.price } -Descending | Select-Object -First 1
-            }
-
-            $currentPrice = [long]$apiItem.price
-            $updatedAgo   = Format-UpdatedAgo $apiItem.updated
-
-            $avg24h = [long]$apiItem.avg24hPrice
-            $avg7d  = [long]$apiItem.avg7daysPrice
-
-            $refAvg = $null
-            if     ($avgSource -eq 'avg24h')   { $refAvg = $avg24h }
-            elseif ($avgSource -eq 'avg7d')    { $refAvg = $avg7d }
-            elseif ($avgSource -match '^\d+$') { $refAvg = [long]$avgSource }
-
-            $diffVal   = if ($refAvg -and $refAvg -gt 0) { ($currentPrice - $refAvg) / $refAvg * 100.0 } else { $null }
-            $diffLabel = if ($null -ne $diffVal)         { '{0:+0.0;-0.0}%' -f $diffVal }                else { '' }
-
-            $isPercent   = $alertVal -match '^(\d+(?:\.\d+)?)%$'
-            $triggered   = $false
-            $targetPrice = $null
-
-            if ($isPercent) {
-                $pct = [double]$Matches[1]
-                if ($direction -eq 'B') {
-                    $targetPrice = [long]($refAvg * (1.0 - $pct / 100.0))
-                    $triggered   = $currentPrice -lt $targetPrice
-                }
-                else {
-                    $targetPrice = [long]($refAvg * (1.0 + $pct / 100.0))
-                    $triggered   = $currentPrice -gt $targetPrice
-                }
-            }
-            else {
-                $targetPrice = [long]$alertVal
-                if ($direction -eq 'B') { $triggered = $currentPrice -lt $targetPrice }
-                else                    { $triggered = $currentPrice -gt $targetPrice }
-            }
-
-            $targetOverride = $cfg['target']
-            if ($targetOverride -and $targetOverride -match '^\d+$') {
-                $targetPrice = [long]$targetOverride
-            }
-
-            # ── colors ───────────────────────────────────────────────────────
-
-            $priceColor  = if ($triggered) { 'Yellow' } else { 'Cyan' }
-            $labelColor  = if ($triggered) { $bsColor  } else { 'Gray' }
-            $targetColor = if ($triggered) { 'Yellow' } else { 'DarkGray' }
-
-            $diffColor = if ($triggered) {
-                'Yellow'
-            } elseif ($null -eq $diffVal) {
-                'DarkGray'
-            } elseif ($direction -eq 'B') {
-                if   ($diffVal -lt 0) { 'Green' } elseif ($diffVal -gt 0) { 'Red' } else { 'Gray' }
-            } else {
-                if   ($diffVal -gt 0) { 'Green' } elseif ($diffVal -lt 0) { 'Red' } else { 'Gray' }
-            }
-
-            # ── row output ───────────────────────────────────────────────────
-
+        foreach ($r in $rows) {
             wh "  " -NoNewline
-            wh $direction $bsColor -NoNewline
+            wh $r.direction $r.bsColor -NoNewline
             wh "  " -NoNewline
-            wh ("{0,-$wLabel}" -f $label) $labelColor -NoNewline
+            wh ("{0,-$wLabel}" -f $r.label) $r.labelColor -NoNewline
             wh "  " -NoNewline
-            wh ("{0,$wPrice}" -f (Format-Price $currentPrice)) $priceColor -NoNewline
+            wh ("{0,$wPrice}" -f (Format-Price $r.currentPrice)) $r.priceColor -NoNewline
             wh " $rub   " DarkGray -NoNewline
-            if ($null -ne $targetPrice) {
-                wh ("{0,$wTarget}" -f (Format-Price $targetPrice)) $targetColor -NoNewline
+            if ($null -ne $r.targetPrice) {
+                wh ("{0,$wTarget}" -f (Format-Price $r.targetPrice)) $r.targetColor -NoNewline
                 wh " $rub   " DarkGray -NoNewline
             } else {
                 wh ("{0,$wTarget}" -f '') -NoNewline
                 wh "      " -NoNewline
             }
-            wh ("{0,$wDiff}" -f $diffLabel) $diffColor -NoNewline
+            wh ("{0,$wDiff}" -f $r.diffLabel) $r.diffColor -NoNewline
             wh "    " -NoNewline
-            wh ("{0,$wAvg}" -f (Format-Price $avg24h)) DarkGray -NoNewline
+            wh ("{0,$wAvg}" -f (Format-Price $r.avg24h)) DarkGray -NoNewline
             wh " $rub   " DarkGray -NoNewline
             if (-not $useFree) {
-                wh ("{0,$wAvg}" -f (Format-Price $avg7d)) DarkGray -NoNewline
+                wh ("{0,$wAvg}" -f (Format-Price $r.avg7d)) DarkGray -NoNewline
                 wh " $rub   " DarkGray -NoNewline
             }
-            wh ("{0,-$wUpd}" -f $updatedAgo) DarkGray -NoNewline
-            if ($triggered) { wh "  !!" $bsColor -NoNewline }
-            Write-Host ""
-
-            # ── alert bookkeeping ────────────────────────────────────────────
-            if ($triggered) {
-                $prev = $lastAlertedPrice[$section]
-                if ($null -eq $prev) {
-                    $alerts += @{ Label = $label; Direction = $direction }
-                    $freshAlerts += $label
-                    $lastAlertedPrice[$section] = $currentPrice
-                }
-                elseif ($currentPrice -ne $prev) {
-                    $alerts += @{ Label = $label; Direction = $direction }
-                    $lastAlertedPrice[$section] = $currentPrice
-                }
-                else {
-                    $alerts += @{ Label = $label; Direction = $direction }
-                }
+            wh ("{0,-$wUpd}" -f $r.updatedAgo) DarkGray -NoNewline
+            if (-not $useFree) {
+                $srcMark = if ($r.source -eq 'free') { '*' } else { ' ' }
+                wh " $srcMark" DarkGray -NoNewline
             }
-            else { $lastAlertedPrice.Remove($section) }
+            if ($r.triggered) { wh "  !!" $r.bsColor -NoNewline }
+            Write-Host ""
         }
 
         Write-Host ""
