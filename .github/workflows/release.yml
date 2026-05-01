@@ -24,6 +24,20 @@ jobs:
             how-to-get-api-key.png \
             where-to-get-item-name.png
 
+      - name: Resolve release notes from latest PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty')
+          NOTES=""
+          if [ -n "$PR" ]; then
+            NOTES=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --jq '.[-1].body // empty')
+          fi
+          if [ -z "$NOTES" ]; then
+            NOTES="Latest build from main."
+          fi
+          printf '%s\n' "$NOTES" > release-notes.md
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,4 +47,4 @@ jobs:
           git push -f origin latest
           gh release create latest tarkov-flip-chimer.zip \
             --title "Latest" \
-            --notes "Latest build from main."
+            --notes-file release-notes.md
