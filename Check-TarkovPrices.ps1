@@ -26,14 +26,6 @@ function Play-SoundWithVolume {
     }
 }
 
-function Scroll-ToBottom {
-    try {
-        $top = [Math]::Max(0, [Console]::CursorTop - [Console]::WindowHeight + 1)
-        [Console]::SetWindowPosition(0, $top)
-    }
-    catch {}
-}
-
 function Read-IniFile {
     param([string]$Path)
     $result  = [ordered]@{}
@@ -89,19 +81,30 @@ function Format-UpdatedAgo {
     catch { return '' }
 }
 
-function Get-TarkovItem {
-    param([string]$Query, [string]$ApiKey)
-    $uri = "https://api.tarkov-market.app/api/v1/item?q=$([uri]::EscapeDataString($Query))"
+function Get-TarkovItemsAll {
+    param([string]$ApiKey)
+    $uri = "https://api.tarkov-market.app/api/v1/items/all"
     try {
-        $r = Invoke-RestMethod -Uri $uri -Headers @{ 'x-api-key' = $ApiKey } -Method Get -ErrorAction Stop
-        if ($r -and $r.Count -gt 0) { return $r }
+        return Invoke-RestMethod -Uri $uri -Headers @{ 'x-api-key' = $ApiKey } -Method Get -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "  Bulk API error: $_"
+        return $null
+    }
+}
+
+function Find-TarkovItemLocal {
+    param($AllItems, [string]$Query)
+    $q     = $Query.ToLower()
+    $found = @($AllItems | Where-Object {
+        ($_.name      -and $_.name.ToLower().Contains($q)) -or
+        ($_.shortName -and $_.shortName.ToLower().Contains($q))
+    })
+    if ($found.Count -eq 0) {
         Write-Warning "  No results for: $Query"
         return $null
     }
-    catch {
-        Write-Warning "  API error for '$Query': $_"
-        return $null
-    }
+    return $found
 }
 
 function Get-TarkovItemFree {
@@ -165,14 +168,14 @@ $useFree = ($apiKey -eq 'YOUR_API_KEY_HERE' -or -not $apiKey)
 $itemSections = $ini.Keys | Where-Object { $_ -match '^Item\.' }
 if (-not $itemSections) { Write-Error "No [Item.*] sections in config.ini"; exit 1 }
 
-wh "Tarkov Price Alert started. Press Ctrl+C to stop." Cyan
-if ($useFree) {
-    wh "No API key - using tarkov.dev (free, could be slower and less reliable)." Yellow
-    wh "avg7d unavailable: diff and triggers fall back to avg24h for all items." Yellow
-} else {
-    wh "Using tarkov-market.app." Cyan
-}
-wh "Monitoring $($itemSections.Count) item(s), checking every $checkIntervalSec s." Cyan
+try {
+    $w = [Math]::Min(140, [Console]::LargestWindowWidth)
+    $h = [int][Math]::Min([Math]::Ceiling(1.5 * $itemSections.Count) + 6, [Console]::LargestWindowHeight)
+    if ([Console]::BufferWidth  -lt $w) { [Console]::BufferWidth  = $w }
+    if ([Console]::BufferHeight -lt $h) { [Console]::BufferHeight = $h }
+    [Console]::WindowWidth  = $w
+    [Console]::WindowHeight = $h
+} catch {}
 
 $lastAlertedPrice = @{}
 
@@ -187,10 +190,13 @@ $wTarget = 12
 # ─── main loop ────────────────────────────────────────────────────────────────
 try {
     while ($true) {
-        Scroll-ToBottom
+        [Console]::Clear()
         $timestamp   = Get-Date -Format 'HH:mm:ss'
         $alerts      = @()   # array of @{Label;Direction}
         $freshAlerts = @()
+
+        $apiLabel = if ($useFree) { 'tarkov.dev (free)' } else { 'tarkov-market.app' }
+        wh "Tarkov Price Alert | $apiLabel | $($itemSections.Count) items | every ${checkIntervalSec}s | Ctrl+C to stop" DarkGray
 
         $mid = " $timestamp "
         $sepW = if ($useFree) { 46 } else { 54 }
@@ -201,6 +207,17 @@ try {
         } else {
             wh ("     {0,-$wLabel}  {1,$wPrice}     {2,$wTarget}     {3,$wDiff}    {4,$wAvg}     {5,$wAvg}     {6}" -f `
                 'Item', 'Price', 'Target', 'Diff', 'avg24h', 'avg7d', 'Updated') DarkGray
+        }
+
+        $allItems = $null
+        if (-not $useFree) {
+            $allItems = Get-TarkovItemsAll -ApiKey $apiKey
+            if ($null -eq $allItems) {
+                Write-Host ""
+                wh "  bulk fetch failed, retrying next cycle" DarkGray
+                Start-Sleep -Seconds $checkIntervalSec
+                continue
+            }
         }
 
         foreach ($section in $itemSections) {
@@ -224,7 +241,7 @@ try {
             $bsColor = if ($direction -eq 'B') { 'Green' } else { 'Red' }
 
             $apiItems = if ($useFree) { Get-TarkovItemFree -Query $query } `
-                        else         { Get-TarkovItem -Query $query -ApiKey $apiKey }
+                        else         { Find-TarkovItemLocal -AllItems $allItems -Query $query }
             if (-not $apiItems) { continue }
 
             $usedVal = $cfg['used']
@@ -359,7 +376,6 @@ try {
                 else { Write-Warning "  Sound file not found: $soundFile" }
             }
         }
-        Scroll-ToBottom
         Start-Sleep -Seconds $checkIntervalSec
     }
 }
