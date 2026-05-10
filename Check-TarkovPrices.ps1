@@ -68,6 +68,77 @@ function Read-IniFile {
     return $result
 }
 
+function Initialize-PriceLog {
+    param(
+        [string]$Path,
+        [Nullable[int]]$MaxEntries,
+        [Nullable[long]]$MaxSizeBytes
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not $MaxEntries -and -not $MaxSizeBytes) { return }
+    $lines = [System.IO.File]::ReadAllLines($Path)
+    if (-not $lines -or $lines.Count -eq 0) { return }
+    if ($MaxEntries -and $lines.Count -gt $MaxEntries) {
+        $start = $lines.Count - $MaxEntries
+        $lines = $lines[$start..($lines.Count - 1)]
+    }
+    if ($MaxSizeBytes) {
+        $kept    = New-Object 'System.Collections.Generic.List[string]'
+        $size    = 0
+        $nlBytes = [System.Text.Encoding]::UTF8.GetByteCount([Environment]::NewLine)
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            $b = [System.Text.Encoding]::UTF8.GetByteCount($lines[$i]) + $nlBytes
+            if ($size + $b -gt $MaxSizeBytes) { break }
+            $kept.Insert(0, $lines[$i])
+            $size += $b
+        }
+        $lines = $kept.ToArray()
+    }
+    $enc = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllLines($Path, $lines, $enc)
+}
+
+function Write-PriceLogEntry {
+    param(
+        [string]$Path,
+        [string]$Clock,
+        [hashtable]$Rows,
+        [object[]]$Sections,
+        [object[]]$Alerts
+    )
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($s in $Sections) {
+        if ($s -notmatch '^Item\.') { continue }
+        if (-not $Rows.Contains($s)) { continue }
+        $r = $Rows[$s]
+        $items.Add([ordered]@{
+            label        = $r.label
+            direction    = $r.direction
+            currentPrice = $r.currentPrice
+            targetPrice  = $r.targetPrice
+            diff         = $r.diffLabel
+            avg24h       = $r.avg24h
+            avg7d        = $r.avg7d
+            updated      = $r.updatedAgo
+            source       = $r.source
+            triggered    = $r.triggered
+        })
+    }
+    $alertList = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($a in $Alerts) {
+        $alertList.Add([ordered]@{ label = $a.Label; direction = $a.Direction })
+    }
+    $entry = [ordered]@{
+        time   = (Get-Date).ToString('o')
+        clock  = $Clock
+        items  = $items
+        alerts = $alertList
+    }
+    $json = $entry | ConvertTo-Json -Depth 6 -Compress
+    $enc  = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::AppendAllText($Path, $json + [Environment]::NewLine, $enc)
+}
+
 function Format-Price {
     param([long]$Value)
     return '{0:N0}' -f $Value
@@ -244,6 +315,94 @@ function wh {
     else            { Write-Host $Text -ForegroundColor $Color }
 }
 
+function Write-SepLine {
+    param([string]$Text, [string]$Color = 'DarkGray')
+    if ($Color -match '^#([0-9A-Fa-f]{6})$') {
+        $r = [Convert]::ToInt32($Matches[1].Substring(0,2), 16)
+        $g = [Convert]::ToInt32($Matches[1].Substring(2,2), 16)
+        $b = [Convert]::ToInt32($Matches[1].Substring(4,2), 16)
+        Write-Host "`e[38;2;${r};${g};${b}m${Text}`e[0m"
+    } else {
+        Write-Host $Text -ForegroundColor $Color
+    }
+}
+
+function Write-ColumnHeader {
+    param([switch]$NoNewline)
+    if ($useFree) {
+        $text = "     {0,-$wLabel}  {1,$wPrice}     {2,$wTarget}     {3,$wDiff}    {4,$wAvg}     {5,-$wUpd}" -f `
+            'Item', 'Price', 'Target', 'Diff', 'avg24h', 'Updated'
+    } else {
+        $text = "     {0,-$wLabel}  {1,$wPrice}     {2,$wTarget}     {3,$wDiff}    {4,$wAvg}     {5,$wAvg}     {6,-$wUpd}" -f `
+            'Item', 'Price', 'Target', 'Diff', 'avg24h', 'avg7d', 'Updated'
+    }
+    if ($NoNewline) { Write-Host $text -ForegroundColor DarkGray -NoNewline }
+    else            { Write-Host $text -ForegroundColor DarkGray }
+}
+
+function Write-ItemRow {
+    param($r)
+    wh "  " -NoNewline
+    wh $r.direction $r.bsColor -NoNewline
+    wh "  " -NoNewline
+    wh ("{0,-$wLabel}" -f $r.label) $r.labelColor -NoNewline
+    wh "  " -NoNewline
+    wh ("{0,$wPrice}" -f (Format-Price $r.currentPrice)) $r.priceColor -NoNewline
+    wh " $rub   " DarkGray -NoNewline
+    if ($null -ne $r.targetPrice) {
+        wh ("{0,$wTarget}" -f (Format-Price $r.targetPrice)) $r.targetColor -NoNewline
+        wh " $rub   " DarkGray -NoNewline
+    } else {
+        wh ("{0,$wTarget}" -f '') -NoNewline
+        wh "      " -NoNewline
+    }
+    wh ("{0,$wDiff}" -f $r.diffLabel) $r.diffColor -NoNewline
+    wh "    " -NoNewline
+    wh ("{0,$wAvg}" -f (Format-Price $r.avg24h)) DarkGray -NoNewline
+    wh " $rub   " DarkGray -NoNewline
+    if (-not $useFree) {
+        wh ("{0,$wAvg}" -f (Format-Price $r.avg7d)) DarkGray -NoNewline
+        wh " $rub   " DarkGray -NoNewline
+    }
+    wh ("{0,-$wUpd}" -f $r.updatedAgo) $r.updatedColor -NoNewline
+    if ($r.triggered) { wh "  !!" $r.bsColor -NoNewline }
+}
+
+function Write-Alert {
+    param($a, [switch]$NoNewline)
+    if ($a.Direction -eq 'B') {
+        $text  = "  !! good time to buy $($a.Label) !!"
+        $color = 'Green'
+    } else {
+        $text  = "  !! good time to sell $($a.Label) !!"
+        $color = 'Red'
+    }
+    if ($NoNewline) { Write-Host $text -ForegroundColor $color -NoNewline }
+    else            { Write-Host $text -ForegroundColor $color }
+}
+
+function Write-SeparatorRow {
+    param([string]$Section, [int]$Width, [switch]$NoNewline)
+    $sepLabel = $Section -replace '^Separator\.', ''
+    $sepColor = if ($ini[$Section]['color']) { $ini[$Section]['color'] } else { 'DarkGray' }
+    $mid      = if ($sepLabel) { " $sepLabel " } else { $dash * 4 }
+    $sides    = [Math]::Max(2, [Math]::Floor(($Width - $mid.Length) / 2))
+    $text     = ($dash * $sides) + $mid + ($dash * $sides)
+    if     ($text.Length -lt $Width) { $text += ($dash * ($Width - $text.Length)) }
+    elseif ($text.Length -gt $Width) { $text  = $text.Substring(0, $Width) }
+
+    if ($sepColor -match '^#([0-9A-Fa-f]{6})$') {
+        $rr = [Convert]::ToInt32($Matches[1].Substring(0,2), 16)
+        $gg = [Convert]::ToInt32($Matches[1].Substring(2,2), 16)
+        $bb = [Convert]::ToInt32($Matches[1].Substring(4,2), 16)
+        $line = "`e[38;2;${rr};${gg};${bb}m${text}`e[0m"
+        if ($NoNewline) { Write-Host $line -NoNewline } else { Write-Host $line }
+    } else {
+        if ($NoNewline) { Write-Host $text -ForegroundColor $sepColor -NoNewline }
+        else            { Write-Host $text -ForegroundColor $sepColor }
+    }
+}
+
 # ─── startup ──────────────────────────────────────────────────────────────────
 
 $scriptDir  = $PSScriptRoot
@@ -268,22 +427,46 @@ $volume = [Math]::Max(0, [Math]::Min(100, $v))
 
 $useFree = ($apiKey -eq 'YOUR_API_KEY_HERE' -or -not $apiKey)
 
-$itemSections = $ini.Keys | Where-Object { $_ -match '^Item\.' }
+$itemSections      = $ini.Keys | Where-Object { $_ -match '^Item\.' }
+$displaySections   = $ini.Keys | Where-Object { $_ -match '^(Item|Separator)\.' }
+$separatorSections = @($ini.Keys | Where-Object { $_ -match '^Separator\.' })
 if (-not $itemSections) { Write-Error "No [Item.*] sections in config.ini"; exit 1 }
 
-try {
-    $w = [Math]::Min(140, [Console]::LargestWindowWidth)
-    $h = [int][Math]::Min([Math]::Ceiling(1.5 * $itemSections.Count) + 6, [Console]::LargestWindowHeight)
-    if ([Console]::BufferWidth  -lt $w) { [Console]::BufferWidth  = $w }
-    if ([Console]::BufferHeight -lt $h) { [Console]::BufferHeight = $h }
-    [Console]::WindowWidth  = $w
-    [Console]::WindowHeight = $h
-} catch {}
+# two-column mode: presence of [Column.Break] both enables it and marks split point
+$leftSections  = New-Object System.Collections.Generic.List[string]
+$rightSections = New-Object System.Collections.Generic.List[string]
+$seenBreak     = $false
+foreach ($k in $ini.Keys) {
+    if ($k -eq 'Column.Break') { $seenBreak = $true; continue }
+    if ($k -match '^(Item|Separator)\.') {
+        if ($seenBreak) { $rightSections.Add($k) | Out-Null }
+        else            { $leftSections.Add($k)  | Out-Null }
+    }
+}
+$twoColumn     = $seenBreak
+$splitTriggers = $false
+if ($twoColumn -and $ini.Contains('Column.Break')) {
+    $val = $ini['Column.Break']['splitTriggers']
+    if ($val) { $splitTriggers = ($val.ToString().ToLower() -in @('yes','true','1','on')) }
+}
 
-Disable-ConsoleQuickEdit
-
-$lastAlertedPrice = @{}
-$lastPrices       = @{}
+# logging
+$logEnabled      = $false
+$logPath         = $null
+$logMaxEntries   = $null
+$logMaxSizeBytes = $null
+if ($ini.Contains('Logging')) {
+    $logging = $ini['Logging']
+    $en      = $logging['enabled']
+    $logEnabled = ($en -and ($en.ToString().ToLower() -in @('yes','true','1','on')))
+    if ($logEnabled) {
+        $rel     = if ($logging['path']) { $logging['path'] } else { 'prices.log.jsonl' }
+        $logPath = Join-Path $scriptDir $rel
+        if ($logging['maxEntries'] -match '^\d+$') { $logMaxEntries   = [int]$logging['maxEntries'] }
+        if ($logging['maxSizeKB']  -match '^\d+$') { $logMaxSizeBytes = [long]$logging['maxSizeKB'] * 1024 }
+        Initialize-PriceLog -Path $logPath -MaxEntries $logMaxEntries -MaxSizeBytes $logMaxSizeBytes
+    }
+}
 
 # column widths
 $wLabel  = 20
@@ -293,14 +476,49 @@ $wDiff   = 7
 $wUpd    = 12
 $wTarget = 12
 
+$contentWidth = 5 + $wLabel + 2 + $wPrice + 5 + $wTarget + 5 + $wDiff + 4 + $wAvg + 5
+if (-not $useFree) { $contentWidth += $wAvg + 5 }
+$contentWidth += $wUpd + 4   # +4 for "  !!" trigger mark
+
+$colWidth   = $contentWidth
+$gutterText = ' ' + ([char]0x2502) + ' '
+
+# lineWidth = window width; slightly wider than content so "  !!" never wraps
+if ($twoColumn) {
+    $lineWidth = [Math]::Min($colWidth * 2 + $gutterText.Length + 4, [Console]::LargestWindowWidth)
+} else {
+    $lineWidth = [Math]::Min($contentWidth + 4, [Console]::LargestWindowWidth)
+}
+
+try {
+    if ($twoColumn) {
+        $rowsPerSide = [Math]::Max($leftSections.Count, $rightSections.Count)
+        $h = [Math]::Min([Math]::Ceiling(1.4 * $rowsPerSide) + 8, [Console]::LargestWindowHeight)
+    } else {
+        $h = [Math]::Min([Math]::Ceiling(1.3 * $itemSections.Count) + $separatorSections.Count + 6, [Console]::LargestWindowHeight)
+    }
+    $bufW = [Math]::Min($lineWidth + 40, [Console]::LargestWindowWidth)
+    if ([Console]::BufferWidth  -lt $bufW) { [Console]::BufferWidth  = $bufW }
+    if ([Console]::BufferHeight -lt $h)    { [Console]::BufferHeight = $h }
+    [Console]::WindowWidth  = $lineWidth
+    [Console]::WindowHeight = $h
+} catch {}
+
+Disable-ConsoleQuickEdit
+
+$lastAlertedPrice = @{}
+$lastPrices       = @{}
+
 # ─── main loop ────────────────────────────────────────────────────────────────
 try {
     while ($true) {
         $timestamp   = Get-Date -Format 'HH:mm:ss'
-        $alerts      = @()   # array of @{Label;Direction}
-        $freshAlerts = @()
-        $rows        = New-Object System.Collections.Generic.List[object]
-        $fetchError  = $null
+        $alerts        = @()   # array of @{Label;Direction}
+        $freshAlerts   = @()
+        $rowsBySection = @{}
+        $fetchError    = $null
+        $firstCycle    = ($lastPrices.Count -eq 0)
+        $anyChanged    = $false
 
         $apiLabel = if ($useFree) { 'tarkov.dev (free)' } else { 'tarkov-market.app + tarkov.dev' }
 
@@ -372,6 +590,7 @@ try {
 
                 $prevPrice = $lastPrices[$section]
                 $changed   = ($null -ne $prevPrice) -and ($prevPrice -ne $currentPrice)
+                if ($changed) { $anyChanged = $true }
                 $lastPrices[$section] = $currentPrice
 
                 $avg24h = [long]$apiItem.avg24hPrice
@@ -428,7 +647,7 @@ try {
                     if   ($diffVal -gt 0) { 'Green' } elseif ($diffVal -lt 0) { 'Red' } else { 'Gray' }
                 }
 
-                $rows.Add([PSCustomObject]@{
+                $rowsBySection[$section] = [PSCustomObject]@{
                     direction    = $direction
                     bsColor      = $bsColor
                     label        = $label
@@ -445,35 +664,41 @@ try {
                     updatedColor = $updatedColor
                     source       = $apiItem.source
                     triggered    = $triggered
-                })
+                }
 
                 # ── alert bookkeeping ────────────────────────────────────────────
                 if ($triggered) {
                     $prev = $lastAlertedPrice[$section]
                     if ($null -eq $prev) {
-                        $alerts += @{ Label = $label; Direction = $direction }
+                        $alerts += @{ Label = $label; Direction = $direction; Section = $section }
                         $freshAlerts += $label
                         $lastAlertedPrice[$section] = $currentPrice
                     }
                     elseif ($currentPrice -ne $prev) {
-                        $alerts += @{ Label = $label; Direction = $direction }
+                        $alerts += @{ Label = $label; Direction = $direction; Section = $section }
                         $lastAlertedPrice[$section] = $currentPrice
                     }
                     else {
-                        $alerts += @{ Label = $label; Direction = $direction }
+                        $alerts += @{ Label = $label; Direction = $direction; Section = $section }
                     }
                 }
                 else { $lastAlertedPrice.Remove($section) }
             }
         }
 
+        # ── log phase: append JSON line if data changed (or first cycle) ──
+        if ($logEnabled -and -not $fetchError -and ($firstCycle -or $anyChanged)) {
+            Write-PriceLogEntry -Path $logPath -Clock $timestamp `
+                -Rows $rowsBySection -Sections $displaySections -Alerts $alerts
+        }
+
         # ── render phase: clear screen, print everything in one burst ───
         [Console]::Clear()
         wh "Tarkov Price Alert | $apiLabel | $($itemSections.Count) items | every ${checkIntervalSec}s | Ctrl+C to stop" DarkGray
 
-        $mid = " $timestamp "
-        $sepW = if ($useFree) { 46 } else { 54 }
-        wh (($dash * $sepW) + $mid + ($dash * $sepW)) DarkGray
+        $mid   = " $timestamp "
+        $sides = [Math]::Floor(($lineWidth - $mid.Length) / 2)
+        wh (($dash * $sides) + $mid + ($dash * $sides)) DarkGray
 
         if ($fetchError) {
             Write-Host ""
@@ -482,58 +707,78 @@ try {
             continue
         }
 
-        if ($useFree) {
-            wh ("     {0,-$wLabel}  {1,$wPrice}     {2,$wTarget}     {3,$wDiff}    {4,$wAvg}     {5}" -f `
-                'Item', 'Price', 'Target', 'Diff', 'avg24h', 'Updated') DarkGray
-        } else {
-            wh ("     {0,-$wLabel}  {1,$wPrice}     {2,$wTarget}     {3,$wDiff}    {4,$wAvg}     {5,$wAvg}     {6}" -f `
-                'Item', 'Price', 'Target', 'Diff', 'avg24h', 'avg7d', 'Updated') DarkGray
-        }
+        if (-not $twoColumn) {
+            Write-ColumnHeader
 
-        foreach ($r in $rows) {
-            wh "  " -NoNewline
-            wh $r.direction $r.bsColor -NoNewline
-            wh "  " -NoNewline
-            wh ("{0,-$wLabel}" -f $r.label) $r.labelColor -NoNewline
-            wh "  " -NoNewline
-            wh ("{0,$wPrice}" -f (Format-Price $r.currentPrice)) $r.priceColor -NoNewline
-            wh " $rub   " DarkGray -NoNewline
-            if ($null -ne $r.targetPrice) {
-                wh ("{0,$wTarget}" -f (Format-Price $r.targetPrice)) $r.targetColor -NoNewline
-                wh " $rub   " DarkGray -NoNewline
-            } else {
-                wh ("{0,$wTarget}" -f '') -NoNewline
-                wh "      " -NoNewline
+            foreach ($section in $displaySections) {
+                if ($section -match '^Separator\.') {
+                    Write-SeparatorRow $section $lineWidth
+                    continue
+                }
+                if (-not $rowsBySection.ContainsKey($section)) { continue }
+                Write-ItemRow $rowsBySection[$section]
+                Write-Host ""
             }
-            wh ("{0,$wDiff}" -f $r.diffLabel) $r.diffColor -NoNewline
-            wh "    " -NoNewline
-            wh ("{0,$wAvg}" -f (Format-Price $r.avg24h)) DarkGray -NoNewline
-            wh " $rub   " DarkGray -NoNewline
-            if (-not $useFree) {
-                wh ("{0,$wAvg}" -f (Format-Price $r.avg7d)) DarkGray -NoNewline
-                wh " $rub   " DarkGray -NoNewline
-            }
-            wh ("{0,-$wUpd}" -f $r.updatedAgo) $r.updatedColor -NoNewline
-            if (-not $useFree) {
-                $srcMark = if ($r.source -eq 'free') { '*' } else { ' ' }
-                wh " $srcMark" DarkGray -NoNewline
-            }
-            if ($r.triggered) { wh "  !!" $r.bsColor -NoNewline }
+        }
+        else {
+            Write-ColumnHeader -NoNewline
+            [Console]::CursorLeft = $colWidth
+            Write-Host $gutterText -NoNewline -ForegroundColor DarkGray
+            Write-ColumnHeader -NoNewline
             Write-Host ""
+
+            $maxRows = [Math]::Max($leftSections.Count, $rightSections.Count)
+            for ($i = 0; $i -lt $maxRows; $i++) {
+                $leftSec  = if ($i -lt $leftSections.Count)  { $leftSections[$i]  } else { $null }
+                $rightSec = if ($i -lt $rightSections.Count) { $rightSections[$i] } else { $null }
+
+                if ($leftSec) {
+                    if ($leftSec -match '^Separator\.') {
+                        Write-SeparatorRow $leftSec $colWidth -NoNewline
+                    } elseif ($rowsBySection.ContainsKey($leftSec)) {
+                        Write-ItemRow $rowsBySection[$leftSec]
+                    }
+                }
+                [Console]::CursorLeft = $colWidth
+                Write-Host $gutterText -NoNewline -ForegroundColor DarkGray
+                if ($rightSec) {
+                    if ($rightSec -match '^Separator\.') {
+                        Write-SeparatorRow $rightSec $colWidth -NoNewline
+                    } elseif ($rowsBySection.ContainsKey($rightSec)) {
+                        Write-ItemRow $rowsBySection[$rightSec]
+                    }
+                }
+                Write-Host ""
+            }
         }
 
         Write-Host ""
 
+        $alertRightCol = $colWidth + $gutterText.Length
         if ($alerts.Count -eq 0) {
-            wh "  no good deals :(" DarkGray
+            if ($twoColumn -and $splitTriggers) {
+                wh "  no good deals :(" DarkGray -NoNewline
+                [Console]::CursorLeft = $alertRightCol
+                wh "  no good deals :(" DarkGray -NoNewline
+                Write-Host ""
+            } else {
+                wh "  no good deals :(" DarkGray
+            }
         }
         else {
-            foreach ($a in $alerts) {
-                if ($a.Direction -eq 'B') {
-                    wh "  !! good time to buy $($a.Label) !!" Green
-                } else {
-                    wh "  !! good time to sell $($a.Label) !!" Red
+            if ($twoColumn -and $splitTriggers) {
+                $leftAlerts  = @($alerts | Where-Object { $leftSections.Contains($_.Section) })
+                $rightAlerts = @($alerts | Where-Object { $rightSections.Contains($_.Section) })
+                $maxAlerts   = [Math]::Max($leftAlerts.Count, $rightAlerts.Count)
+                for ($i = 0; $i -lt $maxAlerts; $i++) {
+                    if ($i -lt $leftAlerts.Count)  { Write-Alert $leftAlerts[$i]  -NoNewline }
+                    [Console]::CursorLeft = $alertRightCol
+                    if ($i -lt $rightAlerts.Count) { Write-Alert $rightAlerts[$i] -NoNewline }
+                    Write-Host ""
                 }
+            }
+            else {
+                foreach ($a in $alerts) { Write-Alert $a }
             }
             if ($freshAlerts.Count -gt 0 -and $volume -gt 0) {
                 if (Test-Path $soundFile) {

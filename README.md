@@ -11,6 +11,12 @@ It polls prices on a configurable interval and plays a **chime** sound the momen
 - **Duplicate suppression** — the chime fires again only when the price actually changes, not every poll cycle
 - **Free mode** — works out of the box via [tarkov.dev](https://tarkov.dev) with no account required
 
+## Will I get banned?
+
+No. This tool never touches the game process — it calls public price APIs in a background terminal window.
+
+For context: [RatScanner](https://ratscanner.com) overlays real-time item data directly on top of the Tarkov window by reading the screen, and even that has never resulted in bans. This tool is strictly less invasive — it only reads a website.
+
 ## Requirements
 
 - Windows 10 / 11
@@ -74,6 +80,76 @@ It polls prices on a configurable interval and plays a **chime** sound the momen
 | `S45000` | Sell when price > 45 000 ₽ |
 | `B15%` | Buy when price is more than 15% below `avgSource` |
 | `S7%` | Sell when price is more than 7% above `avgSource` |
+
+### `[Separator.<Label>]`
+
+Inserts a labeled divider line between item rows. Position in the file determines where it appears. The label is taken from the section name.
+
+| Key | Default | Description |
+|---|---|---|
+| `color` | `DarkGray` | Line color — any PowerShell ConsoleColor name or `#RRGGBB` hex |
+
+**Named colors** (PowerShell ConsoleColor):
+
+| Color | | Color | |
+|---|---|---|---|
+| `Black` | | `DarkBlue` | |
+| `DarkGreen` | subdued green | `DarkCyan` | subdued cyan |
+| `DarkRed` | subdued red | `DarkMagenta` | purple-ish |
+| `DarkYellow` | brown / olive | `DarkGray` | dim *(default)* |
+| `Gray` | neutral | `Blue` | |
+| `Green` | buy / positive | `Cyan` | info |
+| `Red` | sell / negative | `Magenta` | bright purple |
+| `Yellow` | alert | `White` | bright |
+
+**Hex colors** — any RGB value via `#RRGGBB`, e.g. `#8B4513` (brown), `#6A0DAD` (purple), `#4B8BBE` (Python blue).
+
+```ini
+[Separator.Armor & Gear]
+color = DarkCyan
+
+[Separator.Valuables]
+color = #8B6914
+```
+
+### `[Column.Break]`
+
+Optional. If present, splits the output into two side-by-side columns separated by a vertical bar (`│`) — sections above this line render in the left column, sections below render in the right. Useful when the item list is long: window becomes ~2× wider and ~2× shorter. Without `[Column.Break]`, single-column layout is used.
+
+| Key | Default | Notes |
+|---|---|---|
+| `splitTriggers` | `no` | If `yes`, the bottom alerts are also split: triggers from left-column items appear bottom-left, from right-column items bottom-right. Handy when left is your buy list and right is your sell list. |
+
+```ini
+[Item.PACA]
+query = PACA Soft Armor
+alert = 29000
+
+[Column.Break]
+splitTriggers = yes
+
+[Item.Hawk]
+query = Gunpowder "Hawk"
+alert = S25000
+```
+
+### `[Logging]`
+
+Optional. When enabled, appends a JSON Lines entry per cycle to a log file. A new line is written only when at least one item's current price changed since the previous cycle (the very first cycle is always written so the starting state is captured). Each entry mirrors the data shown on screen.
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `no` | `yes` to turn the JSON log on |
+| `path` | `prices.log.jsonl` | Log file path, relative to the script folder |
+| `maxEntries` | — | On startup, keep at most N most recent lines (empty = no limit) |
+| `maxSizeKB` | — | On startup, trim oldest lines so the file fits in N KB (empty = no limit). Both can be set; whichever is more strict wins |
+
+```ini
+[Logging]
+enabled    = yes
+maxEntries = 5000
+maxSizeKB  = 1024
+```
 
 ## Files
 
