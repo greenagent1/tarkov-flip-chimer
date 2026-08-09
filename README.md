@@ -61,6 +61,7 @@ For context: [RatScanner](https://ratscanner.com) overlays real-time item data d
 | `checkIntervalSecs` | `61` | Seconds between API polls |
 | `soundFile` | `alert.wav` | Path to the chime sound (relative to the script folder) |
 | `volume` | `5` | Playback volume 0–100 |
+| `windowHeightOffset` | `0` | Adjust auto-computed console window height in rows. Negative shrinks (e.g. `-7`), positive grows (e.g. `+3`). |
 
 ### `[Item.<Label>]`
 
@@ -68,7 +69,8 @@ For context: [RatScanner](https://ratscanner.com) overlays real-time item data d
 |---|---|---|
 | `query` | — | Search string sent to the API (**required**) |
 | `alert` | — | Alert threshold (**required**) — see format below |
-| `avgSource` | `avg7d` | Reference average: `avg7d`, `avg24h`, or a fixed number. In free mode `avg7d` falls back to `avg24h` |
+| `label` | section name | Display name in the table. Set this to give two sections the same on-screen label (e.g. one buy + one sell tracker for the same item) |
+| `avgSource` | `avg7d` | Reference average: `avg7d`, `avg24h`, a decimal weight (e.g. `0.7`, `1.3`) blending the two, or an integer fixed price. See [Weighted `avgSource`](#weighted-avgsource) |
 | `used` | `no` | `yes` = track the cheapest (worn) variant; `no` = most expensive (new) |
 
 **Alert format**
@@ -80,6 +82,92 @@ For context: [RatScanner](https://ratscanner.com) overlays real-time item data d
 | `S45000` | Sell when price > 45 000 ₽ |
 | `B15%` | Buy when price is more than 15% below `avgSource` |
 | `S7%` | Sell when price is more than 7% above `avgSource` |
+
+#### Same item, two directions
+
+Section headers must be unique, but two sections can share the same display label via `label`. Useful for tracking buy and sell triggers on the same item without arrow-suffixed names:
+
+```ini
+[Item.BitcoinBuy]
+query     = physical bitcoin
+label     = Bitcoin
+avgSource = avg24h
+alert     = B5%
+
+[Item.BitcoinSell]
+query     = physical bitcoin
+label     = Bitcoin
+avgSource = avg24h
+alert     = S7%
+```
+
+Both rows render as `Bitcoin` in the table — the buy and sell trackers stay independent (separate alert state, separate triggers), but the labels match.
+
+#### Weighted `avgSource`
+
+`avgSource` accepts a decimal **weight** that blends the two API averages:
+
+```
+refAvg = avg7d + w * (avg24h - avg7d)
+       = avg7d * (1 − w) + avg24h * w
+```
+
+A decimal point in the value is the marker — `1.0` is a weight, `1` is a fixed price.
+
+| `avgSource` | Meaning |
+|---|---|
+| `0.0` | pure `avg7d` (most stable, slowest to react) |
+| `0.5` | midpoint between the two |
+| `1.0` | pure `avg24h` (most responsive, noisier) |
+| `0.7` | mostly 24h, slightly anchored to 7d |
+| `1.3` | extrapolates **past** `avg24h`, amplifying the recent trend (the gap between 7d and 24h) |
+| `2.0` | doubles the trend signal — aggressive |
+
+**The point.** The current price wiggles minute-to-minute around its average. When `avg24h ≈ avg7d`, the market is calm and `refAvg` barely moves regardless of `w` — so minor wiggles don't push you across the trigger. When `avg24h` drifts away from `avg7d`, that's a real recent shift, and `w > 1` makes `refAvg` lean into it harder so the alert reacts faster.
+
+**Worked numbers** (with `avg7d = 100 000 ₽`):
+
+| Market | `avg24h` | `w=0.0` | `w=0.5` | `w=0.7` | `w=1.0` | `w=1.3` | `w=2.0` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Calm | 100 500 | 100 000 | 100 250 | 100 350 | 100 500 | 100 650 | 101 000 |
+| Up trend +5% | 105 000 | 100 000 | 102 500 | 103 500 | 105 000 | 106 500 | 110 000 |
+| Down trend −3% | 97 000 | 100 000 |  98 500 |  97 900 |  97 000 |  96 100 |  94 000 |
+
+In a calm market the choice of `w` barely matters (the row stays close to 100k either way). In a trending market `w` decides how aggressively `refAvg` follows the trend.
+
+**Free mode.** `avg7d` is unavailable through the free API, so a decimal weight automatically falls back to `avg24h` when no key is configured.
+
+**Examples:**
+
+```ini
+; Stable reference — buy if price drops 15% below the 7-day average,
+; ignore short-term spikes.
+[Item.WaterFilter]
+query     = water filter
+avgSource = avg7d         ; same as 0.0
+alert     = B15%
+
+; Smoothed midpoint — react to recent shifts but don't chase 24h noise.
+[Item.LedX]
+query     = LEDX
+avgSource = 0.5
+alert     = B10%
+
+; Mostly 24h with a slight anchor to 7d — fast, but resists single-spike noise.
+[Item.GpuBuy]
+query     = Graphics card
+label     = GPU
+avgSource = 0.7
+alert     = B12%
+
+; Trend-amplified — refAvg pushes past 24h in the direction the 7d→24h
+; gap points to. Useful for sell triggers when prices are climbing.
+[Item.GpuSell]
+query     = Graphics card
+label     = GPU
+avgSource = 1.3
+alert     = S10%
+```
 
 ### `[Separator.<Label>]`
 

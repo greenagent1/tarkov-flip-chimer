@@ -425,6 +425,9 @@ $volumeRaw    = $general['volume']
 if ($volumeRaw -ne $null -and $volumeRaw -ne '') { $v = [int]$volumeRaw } else { $v = 80 }
 $volume = [Math]::Max(0, [Math]::Min(100, $v))
 
+$windowHeightOffset = 0
+if ($general['windowHeightOffset'] -match '^-?\d+$') { $windowHeightOffset = [int]$general['windowHeightOffset'] }
+
 $useFree = ($apiKey -eq 'YOUR_API_KEY_HERE' -or -not $apiKey)
 
 $itemSections      = $ini.Keys | Where-Object { $_ -match '^Item\.' }
@@ -497,6 +500,7 @@ try {
     } else {
         $h = [Math]::Min([Math]::Ceiling(1.3 * $itemSections.Count) + $separatorSections.Count + 6, [Console]::LargestWindowHeight)
     }
+    $h = [Math]::Max(5, [Math]::Min($h + $windowHeightOffset, [Console]::LargestWindowHeight))
     $bufW = [Math]::Min($lineWidth + 40, [Console]::LargestWindowWidth)
     if ([Console]::BufferWidth  -lt $bufW) { [Console]::BufferWidth  = $bufW }
     if ([Console]::BufferHeight -lt $h)    { [Console]::BufferHeight = $h }
@@ -543,11 +547,19 @@ try {
         if (-not $fetchError) {
             foreach ($section in $itemSections) {
                 $cfg       = $ini[$section]
-                $label     = $section -replace '^Item\.', ''
+                $label     = if ($cfg['label']) { $cfg['label'] } else { $section -replace '^Item\.', '' }
                 $query     = $cfg['query']
                 $avgSource = if ($cfg['avgSource']) { $cfg['avgSource'] } else { 'avg7d' }
-                if ($useFree -and $avgSource -eq 'avg7d') { $avgSource = 'avg24h' }
+                if ($useFree -and ($avgSource -eq 'avg7d' -or $avgSource -match '^-?\d+\.\d+$')) {
+                    $avgSource = 'avg24h'
+                }
                 $alertVal  = $cfg['alert']
+
+                $soundVal     = $cfg['sound']
+                $soundEnabled = $true
+                if ($null -ne $soundVal -and $soundVal -ne '') {
+                    $soundEnabled = ($soundVal.ToString().ToLower() -in @('yes','true','1','on'))
+                }
 
                 if (-not $query -or -not $alertVal) {
                     Write-Warning "  [$section] missing 'query' or 'alert' -- skipping"
@@ -599,6 +611,10 @@ try {
                 $refAvg = $null
                 if     ($avgSource -eq 'avg24h')   { $refAvg = $avg24h }
                 elseif ($avgSource -eq 'avg7d')    { $refAvg = $avg7d }
+                elseif ($avgSource -match '^-?\d+\.\d+$') {
+                    $w = [double]::Parse($avgSource, [System.Globalization.CultureInfo]::InvariantCulture)
+                    $refAvg = [long]($avg7d + $w * ($avg24h - $avg7d))
+                }
                 elseif ($avgSource -match '^\d+$') { $refAvg = [long]$avgSource }
 
                 $diffVal   = if ($refAvg -and $refAvg -gt 0) { ($currentPrice - $refAvg) / $refAvg * 100.0 } else { $null }
@@ -671,7 +687,7 @@ try {
                     $prev = $lastAlertedPrice[$section]
                     if ($null -eq $prev) {
                         $alerts += @{ Label = $label; Direction = $direction; Section = $section }
-                        $freshAlerts += $label
+                        if ($soundEnabled) { $freshAlerts += $label }
                         $lastAlertedPrice[$section] = $currentPrice
                     }
                     elseif ($currentPrice -ne $prev) {
