@@ -11,10 +11,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        run: |
+          VERSION=$(grep -m1 -oE '^; version = .*' config.example.ini | sed 's/^; version = //' | tr -d '[:space:]')
+          if [ -z "$VERSION" ]; then VERSION="0.0"; fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build zip
         run: |
-          zip tarkov-flip-chimer.zip \
+          ZIP_NAME="tarkov-flip-chimer-v${VERSION}.zip"
+          zip "$ZIP_NAME" \
             Check-TarkovPrices.ps1 \
             run.bat \
             config.example.ini \
@@ -23,20 +32,38 @@ jobs:
             README.ru.md \
             how-to-get-api-key.png \
             where-to-get-item-name.png
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
-      - name: Resolve release notes from latest PR comment
+      - name: Build changelog and title
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Prefer the merged PR's own description -- written once at PR
+          # creation time, so it's actually there by the time this runs
+          # (unlike a follow-up comment, which is easy to forget to add).
           PR=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty')
           NOTES=""
           if [ -n "$PR" ]; then
-            NOTES=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --jq '.[-1].body // empty')
+            NOTES=$(gh api "repos/${{ github.repository }}/pulls/$PR" --jq '.body // empty')
           fi
-          if [ -z "$NOTES" ]; then
-            NOTES="Latest build from main."
+          if [ -n "$NOTES" ]; then
+            printf '%s\n' "$NOTES" > release-notes.md
+          else
+            # No PR (direct push) or an empty description -- fall back to
+            # the actual commit history since the last release.
+            PREV_SHA=$(git rev-parse refs/tags/latest 2>/dev/null || echo "")
+            {
+              echo "## Changes"
+              echo
+              if [ -n "$PREV_SHA" ] && git cat-file -e "$PREV_SHA" 2>/dev/null; then
+                git log "$PREV_SHA"..HEAD --no-merges --pretty=format:'- %s (%h)'
+              fi
+            } > release-notes.md
+            if ! grep -q '^-' release-notes.md; then
+              echo "- $(git log -1 --pretty=%s) ($(git rev-parse --short HEAD))" >> release-notes.md
+            fi
           fi
-          printf '%s\n' "$NOTES" > release-notes.md
+          echo "TITLE=v${VERSION} — $(date -u +%Y-%m-%d) (${GITHUB_SHA:0:7})" >> "$GITHUB_ENV"
 
       - name: Publish release
         env:
@@ -45,6 +72,6 @@ jobs:
           gh release delete latest --yes 2>/dev/null || true
           git tag -f latest
           git push -f origin latest
-          gh release create latest tarkov-flip-chimer.zip \
-            --title "Latest" \
+          gh release create latest "$ZIP_NAME" \
+            --title "$TITLE" \
             --notes-file release-notes.md
