@@ -68,6 +68,77 @@ function Read-IniFile {
     return $result
 }
 
+function Get-SharedHttpClient {
+    if (-not $script:http) {
+        if ($PSVersionTable.PSVersion.Major -lt 6) {
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            } catch {}
+            Add-Type -AssemblyName System.Net.Http
+        }
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+        $script:http = New-Object System.Net.Http.HttpClient($handler)
+        $script:http.Timeout = [TimeSpan]::FromSeconds(30)
+        $script:http.DefaultRequestHeaders.Add('Accept', 'application/json')
+        $script:http.DefaultRequestHeaders.Add('User-Agent', 'tarkov-flip-chimer')
+    }
+    return $script:http
+}
+
+function ConvertFrom-JsonCompat {
+    param([string]$Json)
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        return ($Json | ConvertFrom-Json -AsHashtable -Depth 100)
+    }
+    # Windows PowerShell 5.1: ConvertFrom-Json throws on keys that differ only by
+    # case (the tarkov.dev translations file has some). JavaScriptSerializer's
+    # Dictionary<string,object> is case-sensitive and tolerates them.
+    if (-not $script:jsSerializer) {
+        Add-Type -AssemblyName System.Web.Extensions
+        $script:jsSerializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $script:jsSerializer.MaxJsonLength  = [int]::MaxValue
+        $script:jsSerializer.RecursionLimit = 1000
+    }
+    return $script:jsSerializer.DeserializeObject($Json)
+}
+
+$script:httpCache = @{}
+
+function Invoke-CachedJsonGet {
+    # Conditional GET with ETag caching. Returns @{ Status; Data }, Status one of:
+    #   ok           - fresh 200, Data is freshly parsed
+    #   notmodified  - 304, Data is the previously cached parse
+    #   notfound     - 404 (drives game-mode fallback)
+    #   error        - network/parse failure or unusable state; caller retries next cycle
+    param([string]$Uri)
+    $client  = Get-SharedHttpClient
+    $cached  = $script:httpCache[$Uri]
+    $req     = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Uri)
+    if ($cached -and $cached.ETag) {
+        $req.Headers.TryAddWithoutValidation('If-None-Match', $cached.ETag) | Out-Null
+    }
+    try {
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        if ([int]$resp.StatusCode -eq 304) {
+            if ($cached) { return @{ Status = 'notmodified'; Data = $cached.Data } }
+            return @{ Status = 'error'; Data = $null }
+        }
+        if ([int]$resp.StatusCode -eq 404) { return @{ Status = 'notfound'; Data = $null } }
+        if (-not $resp.IsSuccessStatusCode) { return @{ Status = 'error'; Data = $null } }
+        $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $data = ConvertFrom-JsonCompat -Json $text
+        $etag = if ($resp.Headers.ETag) { $resp.Headers.ETag.ToString() } else { $null }
+        $script:httpCache[$Uri] = @{ ETag = $etag; Data = $data }
+        return @{ Status = 'ok'; Data = $data }
+    }
+    catch {
+        Write-Warning "  HTTP error for ${Uri}: $_"
+        return @{ Status = 'error'; Data = $null }
+    }
+    finally { $req.Dispose() }
+}
+
 function Initialize-PriceLog {
     param(
         [string]$Path,
@@ -104,7 +175,8 @@ function Write-PriceLogEntry {
         [string]$Clock,
         [hashtable]$Rows,
         [object[]]$Sections,
-        [object[]]$Alerts
+        [object[]]$Alerts,
+        [string]$GameMode
     )
     $items = New-Object 'System.Collections.Generic.List[object]'
     foreach ($s in $Sections) {
@@ -129,10 +201,11 @@ function Write-PriceLogEntry {
         $alertList.Add([ordered]@{ label = $a.Label; direction = $a.Direction })
     }
     $entry = [ordered]@{
-        time   = (Get-Date).ToString('o')
-        clock  = $Clock
-        items  = $items
-        alerts = $alertList
+        time     = (Get-Date).ToString('o')
+        clock    = $Clock
+        gameMode = $GameMode
+        items    = $items
+        alerts   = $alertList
     }
     $json = $entry | ConvertTo-Json -Depth 6 -Compress
     $enc  = New-Object System.Text.UTF8Encoding $false
@@ -173,8 +246,13 @@ function Format-UpdatedAgo {
 }
 
 function Get-TarkovItemsAll {
-    param([string]$ApiKey)
-    $uri = "https://api.tarkov-market.app/api/v1/items/all"
+    param([string]$ApiKey, [string]$GameMode)
+    $prefix = switch ($GameMode) {
+        'pve'  { 'pve/' }
+        'pvps' { 'season/' }
+        default { '' }
+    }
+    $uri = "https://api.tarkov-market.app/api/v1/${prefix}items/all"
     try {
         return Invoke-RestMethod -Uri $uri -Headers @{ 'x-api-key' = $ApiKey } -Method Get -ErrorAction Stop
     }
@@ -184,25 +262,56 @@ function Get-TarkovItemsAll {
     }
 }
 
+$script:freeBuilt = $null
+
 function Get-TarkovItemsAllFree {
-    $body = @{ query = '{ items { name lastLowPrice avg24hPrice updated } }' } | ConvertTo-Json
+    # tarkov.dev's GraphQL API is dead (422 "GraphQL server unavailable"); the
+    # site itself now reads from json.tarkov.dev. Item names/shortNames in the
+    # main items file are untranslated placeholders ("<id> Name") -- real
+    # strings live in a separate, rarely-changing items_<lang> file.
+    # Returns: item list (possibly $script:freeBuilt reused via 304), or
+    # @{ Status = 'notfound' } if the game mode doesn't exist there yet, or
+    # $null on a transient failure (caller retries next cycle).
+    param([string]$TarkovDevMode)
+
+    $itemsResult = Invoke-CachedJsonGet -Uri "https://json.tarkov.dev/$TarkovDevMode/items"
+    if ($itemsResult.Status -eq 'notfound') { return @{ Status = 'notfound' } }
+    if ($itemsResult.Status -eq 'error')    { return $null }
+
+    $namesResult = Invoke-CachedJsonGet -Uri "https://json.tarkov.dev/$TarkovDevMode/items_en"
+    if ($namesResult.Status -eq 'notfound') { return @{ Status = 'notfound' } }
+    if ($namesResult.Status -eq 'error')    { return $null }
+
+    if ($itemsResult.Status -eq 'notmodified' -and $namesResult.Status -eq 'notmodified' -and $script:freeBuilt) {
+        return $script:freeBuilt
+    }
+
     try {
-        $r = Invoke-RestMethod -Uri 'https://api.tarkov.dev/graphql' -Method Post `
-            -ContentType 'application/json' -Body $body -ErrorAction Stop
-        $items = $r.data.items
-        if (-not $items) { return $null }
-        return $items | ForEach-Object {
-            [PSCustomObject]@{
-                name          = $_.name
-                price         = [long]$_.lastLowPrice
-                avg24hPrice   = [long]$_.avg24hPrice
+        $items = $itemsResult.Data['data']['items']
+        $names = $namesResult.Data['data']
+        $built = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($kv in $items.GetEnumerator()) {
+            $id  = $kv.Key
+            $it  = $kv.Value
+            $low = $it['lastLowPrice']
+            if ($null -eq $low -or [long]$low -le 0) { continue }   # not tradeable on flea
+            $name = $names["$id Name"]
+            if (-not $name) { $name = $it['normalizedName'] }
+            $built.Add([PSCustomObject]@{
+                id            = $id
+                name          = $name
+                shortName     = $names["$id ShortName"]
+                price         = [long]$low
+                avg24hPrice   = [long]$it['avg24hPrice']
                 avg7daysPrice = 0L
-                updated       = $_.updated
-            }
+                updated       = $it['updated']
+            })
         }
+        $script:freeBuilt = $built
+        return $built
     }
     catch {
-        Write-Warning "  Free bulk API error: $_"
+        Write-Warning "  Free bulk parse error: $_"
         return $null
     }
 }
@@ -281,38 +390,66 @@ function Find-TarkovItemLocal {
     return $found
 }
 
-function Get-TarkovItemFree {
-    param([string]$Query)
-    $gql  = '{ items(name: ' + (ConvertTo-Json $Query) + ') { name lastLowPrice avg24hPrice updated } }'
-    $body = @{ query = $gql } | ConvertTo-Json
+$script:debugEnabled = $false
+$script:debugFile    = $null
+$script:debugFrame   = New-Object System.Text.StringBuilder
+$script:debugLine    = New-Object System.Text.StringBuilder
+
+function Write-DebugRaw {
+    param([string]$Text, [switch]$NoNewline)
+    if (-not $script:debugEnabled) { return }
+    [void]$script:debugLine.Append($Text)
+    if (-not $NoNewline) {
+        [void]$script:debugFrame.Append($script:debugLine.ToString()).Append([Environment]::NewLine)
+        [void]$script:debugLine.Clear()
+    }
+}
+
+function Set-DebugCursorLeft {
+    param([int]$Col)
+    if (-not $script:debugEnabled) { return }
+    if ($script:debugLine.Length -lt $Col) {
+        [void]$script:debugLine.Append(' ', ($Col - $script:debugLine.Length))
+    }
+}
+
+function Reset-DebugFrame {
+    if (-not $script:debugEnabled) { return }
+    [void]$script:debugFrame.Clear()
+    [void]$script:debugLine.Clear()
+}
+
+function Complete-DebugFrame {
+    param([string]$Timestamp)
+    if (-not $script:debugEnabled) { return }
+    if ($script:debugLine.Length -gt 0) {
+        [void]$script:debugFrame.Append($script:debugLine.ToString()).Append([Environment]::NewLine)
+        [void]$script:debugLine.Clear()
+    }
+    $enc    = New-Object System.Text.UTF8Encoding $false
+    $header = "=== cycle @ $Timestamp ===" + [Environment]::NewLine
     try {
-        $r = Invoke-RestMethod -Uri 'https://api.tarkov.dev/graphql' -Method Post `
-            -ContentType 'application/json' -Body $body -ErrorAction Stop
-        $items = $r.data.items
-        if (-not $items -or $items.Count -eq 0) {
-            Write-Warning "  No results for: $Query"
-            return $null
-        }
-        return $items | ForEach-Object {
-            [PSCustomObject]@{
-                name          = $_.name
-                price         = [long]$_.lastLowPrice
-                avg24hPrice   = [long]$_.avg24hPrice
-                avg7daysPrice = 0L
-                updated       = $_.updated
+        [System.IO.File]::AppendAllText($script:debugFile, $header + $script:debugFrame.ToString(), $enc)
+        $fi = Get-Item -LiteralPath $script:debugFile -ErrorAction Stop
+        if ($fi.Length -gt 2MB) {
+            $lines        = [System.IO.File]::ReadAllLines($script:debugFile)
+            $frameStarts  = New-Object 'System.Collections.Generic.List[int]'
+            for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -like '=== cycle @ *') { $frameStarts.Add($i) } }
+            if ($frameStarts.Count -gt 20) {
+                $cutIdx = $frameStarts[$frameStarts.Count - 20]
+                [System.IO.File]::WriteAllLines($script:debugFile, $lines[$cutIdx..($lines.Count - 1)], $enc)
             }
         }
     }
-    catch {
-        Write-Warning "  API error for '$Query': $_"
-        return $null
-    }
+    catch { Write-Warning "  Debug log write error: $_" }
+    [void]$script:debugFrame.Clear()
 }
 
 function wh {
     param([string]$Text, [string]$Color = 'Gray', [switch]$NoNewline)
     if ($NoNewline) { Write-Host $Text -ForegroundColor $Color -NoNewline }
     else            { Write-Host $Text -ForegroundColor $Color }
+    Write-DebugRaw -Text $Text -NoNewline:$NoNewline
 }
 
 function Write-SepLine {
@@ -338,6 +475,7 @@ function Write-ColumnHeader {
     }
     if ($NoNewline) { Write-Host $text -ForegroundColor DarkGray -NoNewline }
     else            { Write-Host $text -ForegroundColor DarkGray }
+    Write-DebugRaw -Text $text -NoNewline:$NoNewline
 }
 
 function Write-ItemRow {
@@ -379,6 +517,7 @@ function Write-Alert {
     }
     if ($NoNewline) { Write-Host $text -ForegroundColor $color -NoNewline }
     else            { Write-Host $text -ForegroundColor $color }
+    Write-DebugRaw -Text $text -NoNewline:$NoNewline
 }
 
 function Write-SeparatorRow {
@@ -401,6 +540,7 @@ function Write-SeparatorRow {
         if ($NoNewline) { Write-Host $text -ForegroundColor $sepColor -NoNewline }
         else            { Write-Host $text -ForegroundColor $sepColor }
     }
+    Write-DebugRaw -Text $text -NoNewline:$NoNewline
 }
 
 # ─── startup ──────────────────────────────────────────────────────────────────
@@ -428,7 +568,55 @@ $volume = [Math]::Max(0, [Math]::Min(100, $v))
 $windowHeightOffset = 0
 if ($general['windowHeightOffset'] -match '^-?\d+$') { $windowHeightOffset = [int]$general['windowHeightOffset'] }
 
+$debugVal = $general['debug']
+$script:debugEnabled = ($debugVal -and ($debugVal.ToString().ToLower() -in @('yes','true','1','on')))
+if ($script:debugEnabled) {
+    $debugFileRel     = if ($general['debugFile']) { $general['debugFile'] } else { 'analytics/debug-console.txt' }
+    $script:debugFile = Join-Path $scriptDir $debugFileRel
+    $debugDir         = Split-Path -Parent $script:debugFile
+    if ($debugDir -and -not (Test-Path -LiteralPath $debugDir)) {
+        New-Item -ItemType Directory -Force -Path $debugDir | Out-Null
+    }
+}
+
 $useFree = ($apiKey -eq 'YOUR_API_KEY_HERE' -or -not $apiKey)
+
+# ── game mode: pvp (default) | pve | pvps (PvP Season) ────────────────────
+$gameModeRaw = if ($general['gameMode']) { $general['gameMode'].ToString().ToLower() } else { 'pvp' }
+if ($gameModeRaw -notin @('pvp', 'pve', 'pvps')) {
+    Write-Error "Invalid gameMode '$gameModeRaw' in config.ini -- must be pvp, pve, or pvps"; exit 1
+}
+$gameMode = $gameModeRaw
+
+# tarkovDevMode: which json.tarkov.dev/<mode>/ segment feeds the free source.
+# An explicit config override always wins. Otherwise pvp/pve map directly;
+# pvps is probed at startup since tarkov.dev doesn't have season data yet --
+# this makes the tool pick it up automatically the moment tarkov.dev adds it.
+$freeSourceEnabled = $true
+$tarkovDevMode      = $null
+if ($general['tarkovDevMode']) {
+    $tarkovDevMode = $general['tarkovDevMode'].ToString()
+}
+else {
+    switch ($gameMode) {
+        'pvp' { $tarkovDevMode = 'regular' }
+        'pve' { $tarkovDevMode = 'pve' }
+        'pvps' {
+            foreach ($candidate in @('season', 'pvps')) {
+                $probe = Invoke-CachedJsonGet -Uri "https://json.tarkov.dev/$candidate/items_en"
+                if ($probe.Status -eq 'ok') { $tarkovDevMode = $candidate; break }
+            }
+            if (-not $tarkovDevMode) {
+                if ($useFree) {
+                    Write-Error "gameMode=pvps needs a tarkov-market API key for now -- tarkov.dev has no PvP Season data yet. Set apiKey in config.ini, or set tarkovDevMode manually once tarkov.dev adds season support."
+                    exit 1
+                }
+                $freeSourceEnabled = $false
+                Write-Warning "  tarkov.dev has no PvP Season data yet -- running paid-only via tarkov-market.app. Set tarkovDevMode in config.ini once it appears."
+            }
+        }
+    }
+}
 
 $itemSections      = $ini.Keys | Where-Object { $_ -match '^Item\.' }
 $displaySections   = $ini.Keys | Where-Object { $_ -match '^(Item|Separator)\.' }
@@ -463,8 +651,12 @@ if ($ini.Contains('Logging')) {
     $en      = $logging['enabled']
     $logEnabled = ($en -and ($en.ToString().ToLower() -in @('yes','true','1','on')))
     if ($logEnabled) {
-        $rel     = if ($logging['path']) { $logging['path'] } else { 'prices.log.jsonl' }
+        $rel     = if ($logging['path']) { $logging['path'] } else { 'analytics/prices.log.jsonl' }
         $logPath = Join-Path $scriptDir $rel
+        $logDir  = Split-Path -Parent $logPath
+        if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+        }
         if ($logging['maxEntries'] -match '^\d+$') { $logMaxEntries   = [int]$logging['maxEntries'] }
         if ($logging['maxSizeKB']  -match '^\d+$') { $logMaxSizeBytes = [long]$logging['maxSizeKB'] * 1024 }
         Initialize-PriceLog -Path $logPath -MaxEntries $logMaxEntries -MaxSizeBytes $logMaxSizeBytes
@@ -524,24 +716,43 @@ try {
         $firstCycle    = ($lastPrices.Count -eq 0)
         $anyChanged    = $false
 
-        $apiLabel = if ($useFree) { 'tarkov.dev (free)' } else { 'tarkov-market.app + tarkov.dev' }
-
         # ── compute phase: fetch + per-section work, no console output ────
-        $allItems   = $null
-        $freeByName = @{}
-        if (-not $useFree) {
-            $allItems = Get-TarkovItemsAll -ApiKey $apiKey
+        $allItems  = $null
+        $freeItems = $null
+        $freeById  = @{}
+
+        if ($freeSourceEnabled) {
+            $freeResult = Get-TarkovItemsAllFree -TarkovDevMode $tarkovDevMode
+            if ($freeResult -is [hashtable] -and $freeResult.Status -eq 'notfound') {
+                $freeSourceEnabled = $false
+                if ($useFree) {
+                    $fetchError = "tarkov.dev no longer has $gameMode data, retrying next cycle"
+                }
+                else {
+                    Write-Warning "  tarkov.dev no longer has $gameMode data -- switching to paid-only."
+                }
+            }
+            else {
+                $freeItems = $freeResult
+            }
+        }
+        if ($freeItems) {
+            foreach ($f in $freeItems) { if ($f.id) { $freeById[$f.id] = $f } }
+        }
+
+        if (-not $fetchError -and -not $useFree) {
+            $allItems = Get-TarkovItemsAll -ApiKey $apiKey -GameMode $gameMode
             if ($null -eq $allItems) {
                 $fetchError = 'bulk fetch failed, retrying next cycle'
             }
-            else {
-                $allItemsFree = Get-TarkovItemsAllFree
-                if ($allItemsFree) {
-                    foreach ($f in $allItemsFree) {
-                        if ($f.name) { $freeByName[$f.name.ToLower()] = $f }
-                    }
-                }
-            }
+        }
+
+        $apiLabel = if ($useFree) {
+            "tarkov.dev free ($gameMode)"
+        } elseif ($freeSourceEnabled) {
+            "tarkov-market.app + tarkov.dev ($gameMode)"
+        } else {
+            "tarkov-market.app ($gameMode, paid-only)"
         }
 
         if (-not $fetchError) {
@@ -574,14 +785,13 @@ try {
                 $bsColor = if ($direction -eq 'B') { 'Green' } else { 'Red' }
 
                 if ($useFree) {
-                    $apiItems = Get-TarkovItemFree -Query $query
+                    $apiItems = if ($freeItems) { Find-TarkovItemLocal -AllItems $freeItems -Query $query } else { $null }
                 }
                 else {
                     $paidMatches = Find-TarkovItemLocal -AllItems $allItems -Query $query
                     if ($paidMatches) {
                         $apiItems = @($paidMatches | ForEach-Object {
-                            $key   = if ($_.name) { $_.name.ToLower() } else { $null }
-                            $free  = if ($key -and $freeByName.ContainsKey($key)) { $freeByName[$key] } else { $null }
+                            $free = if ($_.bsgId -and $freeById.ContainsKey($_.bsgId)) { $freeById[$_.bsgId] } else { $null }
                             Merge-PriceSources -PaidItem $_ -FreeItem $free
                         })
                     }
@@ -705,11 +915,12 @@ try {
         # ── log phase: append JSON line if data changed (or first cycle) ──
         if ($logEnabled -and -not $fetchError -and ($firstCycle -or $anyChanged)) {
             Write-PriceLogEntry -Path $logPath -Clock $timestamp `
-                -Rows $rowsBySection -Sections $displaySections -Alerts $alerts
+                -Rows $rowsBySection -Sections $displaySections -Alerts $alerts -GameMode $gameMode
         }
 
         # ── render phase: clear screen, print everything in one burst ───
         [Console]::Clear()
+        Reset-DebugFrame
         wh "Tarkov Price Alert | $apiLabel | $($itemSections.Count) items | every ${checkIntervalSec}s | Ctrl+C to stop" DarkGray
 
         $mid   = " $timestamp "
@@ -717,8 +928,9 @@ try {
         wh (($dash * $sides) + $mid + ($dash * $sides)) DarkGray
 
         if ($fetchError) {
-            Write-Host ""
+            wh ""
             wh "  $fetchError" DarkGray
+            Complete-DebugFrame -Timestamp $timestamp
             Start-Sleep -Seconds $checkIntervalSec
             continue
         }
@@ -733,15 +945,16 @@ try {
                 }
                 if (-not $rowsBySection.ContainsKey($section)) { continue }
                 Write-ItemRow $rowsBySection[$section]
-                Write-Host ""
+                wh ""
             }
         }
         else {
             Write-ColumnHeader -NoNewline
             [Console]::CursorLeft = $colWidth
-            Write-Host $gutterText -NoNewline -ForegroundColor DarkGray
+            Set-DebugCursorLeft $colWidth
+            wh $gutterText DarkGray -NoNewline
             Write-ColumnHeader -NoNewline
-            Write-Host ""
+            wh ""
 
             $maxRows = [Math]::Max($leftSections.Count, $rightSections.Count)
             for ($i = 0; $i -lt $maxRows; $i++) {
@@ -756,7 +969,8 @@ try {
                     }
                 }
                 [Console]::CursorLeft = $colWidth
-                Write-Host $gutterText -NoNewline -ForegroundColor DarkGray
+                Set-DebugCursorLeft $colWidth
+                wh $gutterText DarkGray -NoNewline
                 if ($rightSec) {
                     if ($rightSec -match '^Separator\.') {
                         Write-SeparatorRow $rightSec $colWidth -NoNewline
@@ -764,19 +978,20 @@ try {
                         Write-ItemRow $rowsBySection[$rightSec]
                     }
                 }
-                Write-Host ""
+                wh ""
             }
         }
 
-        Write-Host ""
+        wh ""
 
         $alertRightCol = $colWidth + $gutterText.Length
         if ($alerts.Count -eq 0) {
             if ($twoColumn -and $splitTriggers) {
                 wh "  no good deals :(" DarkGray -NoNewline
                 [Console]::CursorLeft = $alertRightCol
+                Set-DebugCursorLeft $alertRightCol
                 wh "  no good deals :(" DarkGray -NoNewline
-                Write-Host ""
+                wh ""
             } else {
                 wh "  no good deals :(" DarkGray
             }
@@ -789,8 +1004,9 @@ try {
                 for ($i = 0; $i -lt $maxAlerts; $i++) {
                     if ($i -lt $leftAlerts.Count)  { Write-Alert $leftAlerts[$i]  -NoNewline }
                     [Console]::CursorLeft = $alertRightCol
+                    Set-DebugCursorLeft $alertRightCol
                     if ($i -lt $rightAlerts.Count) { Write-Alert $rightAlerts[$i] -NoNewline }
-                    Write-Host ""
+                    wh ""
                 }
             }
             else {
@@ -804,6 +1020,7 @@ try {
                 else { Write-Warning "  Sound file not found: $soundFile" }
             }
         }
+        Complete-DebugFrame -Timestamp $timestamp
         Start-Sleep -Seconds $checkIntervalSec
     }
 }

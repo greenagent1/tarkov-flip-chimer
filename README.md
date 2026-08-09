@@ -10,6 +10,7 @@ It polls prices on a configurable interval and plays a **chime** sound the momen
 - **Live dashboard** — scrolling console table with current price, target, Diff%, 24h average, and time since last update
 - **Duplicate suppression** — the chime fires again only when the price actually changes, not every poll cycle
 - **Free mode** — works out of the box via [tarkov.dev](https://tarkov.dev) with no account required
+- **Game modes** — track PvP, PvE, or PvP Season (`gameMode = pvp | pve | pvps`) prices
 
 ## Will I get banned?
 
@@ -21,7 +22,7 @@ For context: [RatScanner](https://ratscanner.com) overlays real-time item data d
 
 - Windows 10 / 11
 - PowerShell 5.1 or later (ships with Windows)
-- *(Optional)* A paid API key from [tarkov-market.com/dev/api](https://tarkov-market.com/dev/api) for faster, more reliable data and 7-day averages
+- *(Optional)* A paid API key from [tarkov-market.com/dev/api](https://tarkov-market.com/dev/api) for faster, more reliable data and 7-day averages. Required if you want `gameMode = pvps` before tarkov.dev adds season data
 
 ## Quick start
 
@@ -59,9 +60,13 @@ For context: [RatScanner](https://ratscanner.com) overlays real-time item data d
 |---|---|---|
 | `apiKey` | — | tarkov-market.com API key. Leave blank or as placeholder to use tarkov.dev for free |
 | `checkIntervalSecs` | `61` | Seconds between API polls |
+| `gameMode` | `pvp` | `pvp`, `pve`, or `pvps` (PvP Season). tarkov.dev doesn't have PvP Season data yet, so `pvps` runs paid-only (tarkov-market.app) until it does — the tool probes for it automatically at startup and picks it up once it appears |
+| `tarkovDevMode` | (auto) | Advanced/optional: override which `json.tarkov.dev/<mode>/` path feeds the free source, if the automatic `gameMode` mapping ever picks the wrong one |
 | `soundFile` | `alert.wav` | Path to the chime sound (relative to the script folder) |
 | `volume` | `5` | Playback volume 0–100 |
 | `windowHeightOffset` | `0` | Adjust auto-computed console window height in rows. Negative shrinks (e.g. `-7`), positive grows (e.g. `+3`). |
+| `debug` | `no` | `yes` mirrors every rendered frame (table + alerts, no colors) to `debugFile` — useful for diagnosing bad data or misaligned columns without needing to screenshot the console |
+| `debugFile` | `analytics/debug-console.txt` | Path for the debug mirror log (relative to the script folder) |
 
 ### `[Item.<Label>]`
 
