@@ -1,6 +1,9 @@
 # Personal config — contains your API key
 config.ini
 
+# Logs, analysis scripts, backups — local-only
+analytics/
+
 # Windows artifacts
 Thumbs.db
 desktop.ini
