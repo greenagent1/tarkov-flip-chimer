@@ -506,18 +506,49 @@ function Write-ItemRow {
     if ($r.triggered) { wh "  !!" $r.bsColor -NoNewline }
 }
 
+function Get-AlertText {
+    param($a)
+    if ($a.Direction -eq 'B') { return "  !! good time to buy $($a.Label) !!" }
+    return "  !! good time to sell $($a.Label) !!"
+}
+
 function Write-Alert {
     param($a, [switch]$NoNewline)
-    if ($a.Direction -eq 'B') {
-        $text  = "  !! good time to buy $($a.Label) !!"
-        $color = 'Green'
-    } else {
-        $text  = "  !! good time to sell $($a.Label) !!"
-        $color = 'Red'
-    }
+    $text  = Get-AlertText $a
+    $color = if ($a.Direction -eq 'B') { 'Green' } else { 'Red' }
     if ($NoNewline) { Write-Host $text -ForegroundColor $color -NoNewline }
     else            { Write-Host $text -ForegroundColor $color }
     Write-DebugRaw -Text $text -NoNewline:$NoNewline
+}
+
+function Get-AlertColumnLayout {
+    # Chunks a same-direction alert list into sub-columns of up to $WrapAfter
+    # rows each, capped to however many actually fit in $MaxWidth -- if more
+    # chunks would be needed than fit, the overflow is merged into the last
+    # column (it grows taller rather than colliding with the other side).
+    param([object[]]$Alerts, [int]$WrapAfter, [int]$MaxWidth)
+    if (-not $Alerts -or $Alerts.Count -eq 0) { return @{ Columns = @(); ColWidth = 0 } }
+    if ($WrapAfter -le 0 -or $Alerts.Count -le $WrapAfter) {
+        return @{ Columns = @(,$Alerts); ColWidth = $MaxWidth }
+    }
+    $textWidth = ($Alerts | ForEach-Object { (Get-AlertText $_).Length } | Measure-Object -Maximum).Maximum
+    $colWidth  = $textWidth + 2
+    $maxCols   = [Math]::Max(1, [Math]::Floor($MaxWidth / $colWidth))
+
+    $chunks = New-Object 'System.Collections.Generic.List[object]'
+    for ($i = 0; $i -lt $Alerts.Count; $i += $WrapAfter) {
+        $end = [Math]::Min($i + $WrapAfter, $Alerts.Count) - 1
+        $chunks.Add(@($Alerts[$i..$end]))
+    }
+    if ($chunks.Count -gt $maxCols) {
+        $kept = New-Object 'System.Collections.Generic.List[object]'
+        for ($i = 0; $i -lt $maxCols - 1; $i++) { $kept.Add($chunks[$i]) }
+        $overflow = New-Object 'System.Collections.Generic.List[object]'
+        for ($i = $maxCols - 1; $i -lt $chunks.Count; $i++) { $overflow.AddRange([object[]]$chunks[$i]) }
+        $kept.Add(@($overflow.ToArray()))
+        $chunks = $kept
+    }
+    return @{ Columns = @($chunks.ToArray()); ColWidth = $colWidth }
 }
 
 function Write-SeparatorRow {
@@ -694,10 +725,11 @@ try {
         # Reserve extra rows for the alert block below the table -- it can grow
         # well past a couple of lines when many items trigger at once (worse
         # yet when splitTriggers puts them all on one lopsided side). With
-        # alertWrapAfter set, that's the realistic worst case per column;
-        # otherwise reserve a generous flat amount so a burst doesn't scroll
-        # the header out of view.
-        $alertBudget = if ($alertWrapAfter -gt 0) { $alertWrapAfter } else { 15 }
+        # alertWrapAfter set, sub-columns are capped to what fits width-wise,
+        # so an extreme burst can still exceed one column's worth of rows --
+        # budget roughly double as headroom; otherwise reserve a generous
+        # flat amount so a burst doesn't scroll the header out of view.
+        $alertBudget = if ($alertWrapAfter -gt 0) { $alertWrapAfter * 2 } else { 15 }
         $h = [Math]::Min([Math]::Ceiling(1.4 * $rowsPerSide) + 8 + $alertBudget, [Console]::LargestWindowHeight)
     } else {
         $h = [Math]::Min([Math]::Ceiling(1.3 * $itemSections.Count) + $separatorSections.Count + 16, [Console]::LargestWindowHeight)
@@ -1008,21 +1040,42 @@ try {
             }
         }
         else {
-            $leftAlerts = $null
-            if ($twoColumn -and $alertWrapAfter -gt 0 -and $alerts.Count -gt $alertWrapAfter) {
-                # Wrap by raw count, not buy/sell direction -- a lopsided burst
-                # (e.g. all triggers on the buy side) still fills both columns
-                # instead of growing one column past the console window.
-                $leftAlerts  = @($alerts | Select-Object -First $alertWrapAfter)
-                $rightAlerts = @($alerts | Select-Object -Skip  $alertWrapAfter)
+            if ($twoColumn -and $alertWrapAfter -gt 0) {
+                # Buy alerts always in the left half, sell always in the right --
+                # each half wraps into its own extra sub-column(s) past
+                # alertWrapAfter rows, so a lopsided burst (e.g. mostly buys)
+                # never grows past the console window, and buy/sell never mix.
+                $buyAlerts  = @($alerts | Where-Object { $_.Direction -eq 'B' })
+                $sellAlerts = @($alerts | Where-Object { $_.Direction -eq 'S' })
+                $buyLayout  = Get-AlertColumnLayout -Alerts $buyAlerts  -WrapAfter $alertWrapAfter -MaxWidth $colWidth
+                $sellLayout = Get-AlertColumnLayout -Alerts $sellAlerts -WrapAfter $alertWrapAfter -MaxWidth $colWidth
+
+                $maxRows = 0
+                foreach ($c in $buyLayout.Columns)  { $maxRows = [Math]::Max($maxRows, $c.Count) }
+                foreach ($c in $sellLayout.Columns) { $maxRows = [Math]::Max($maxRows, $c.Count) }
+
+                for ($i = 0; $i -lt $maxRows; $i++) {
+                    $x = 0
+                    foreach ($c in $buyLayout.Columns) {
+                        [Console]::CursorLeft = $x
+                        Set-DebugCursorLeft $x
+                        if ($i -lt $c.Count) { Write-Alert $c[$i] -NoNewline }
+                        $x += $buyLayout.ColWidth
+                    }
+                    $x = $alertRightCol
+                    foreach ($c in $sellLayout.Columns) {
+                        [Console]::CursorLeft = $x
+                        Set-DebugCursorLeft $x
+                        if ($i -lt $c.Count) { Write-Alert $c[$i] -NoNewline }
+                        $x += $sellLayout.ColWidth
+                    }
+                    wh ""
+                }
             }
             elseif ($twoColumn -and $splitTriggers) {
                 $leftAlerts  = @($alerts | Where-Object { $leftSections.Contains($_.Section) })
                 $rightAlerts = @($alerts | Where-Object { $rightSections.Contains($_.Section) })
-            }
-
-            if ($leftAlerts) {
-                $maxAlerts = [Math]::Max($leftAlerts.Count, $rightAlerts.Count)
+                $maxAlerts   = [Math]::Max($leftAlerts.Count, $rightAlerts.Count)
                 for ($i = 0; $i -lt $maxAlerts; $i++) {
                     if ($i -lt $leftAlerts.Count)  { Write-Alert $leftAlerts[$i]  -NoNewline }
                     [Console]::CursorLeft = $alertRightCol

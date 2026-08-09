@@ -213,8 +213,8 @@ The bottom alert list has three layouts, checked in this order:
 
 | Key | Default | Notes |
 |---|---|---|
-| `alertWrapAfter` | off | Once the alert count exceeds this number, continue in a second column instead of growing taller. Splits by raw count, not buy/sell — so a lopsided burst (e.g. 20 buy alerts, 1 sell) still fills both columns instead of scrolling the table off the top of the window. Takes priority over `splitTriggers` when both are set. |
-| `splitTriggers` | `no` | If `yes` (and `alertWrapAfter` didn't kick in), triggers from left-column items appear bottom-left, from right-column items bottom-right. Handy when left is your buy list and right is your sell list — but a lopsided burst still grows one side tall on its own, since it's split by side, not by count. |
+| `alertWrapAfter` | off | Buy alerts always render in the left half, sell alerts always in the right half — never mixed. Once either half exceeds this many rows, it wraps into its own extra sub-column(s), so a lopsided burst (e.g. 20 buy alerts, 1 sell) never grows one side past the console window. Takes priority over `splitTriggers` when both are set (`splitTriggers` still applies below the threshold). |
+| `splitTriggers` | `no` | If `yes` (and `alertWrapAfter` didn't kick in), triggers from left-column items appear bottom-left, from right-column items bottom-right. Handy when left is your buy list and right is your sell list — but with no count cap, a lopsided burst still grows that side as tall as an unsplit list would; prefer `alertWrapAfter` to bound that. |
 
 If neither is set, alerts render as one plain vertical list.
 
@@ -224,8 +224,9 @@ query = PACA Soft Armor
 alert = 29000
 
 [Column.Break]
-alertWrapAfter = 10   ; wrap alerts into a 2nd column past 10, regardless of side
-splitTriggers  = yes  ; fallback when alert count is under alertWrapAfter
+alertWrapAfter = 10   ; buy alerts left, sell alerts right; each side wraps
+                       ; into its own sub-column(s) past 10 rows
+splitTriggers  = yes   ; fallback while alert counts are under alertWrapAfter
 
 [Item.Hawk]
 query = Gunpowder "Hawk"
