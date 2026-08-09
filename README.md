@@ -209,9 +209,14 @@ color = #8B6914
 
 Optional. If present, splits the output into two side-by-side columns separated by a vertical bar (`│`) — sections above this line render in the left column, sections below render in the right. Useful when the item list is long: window becomes ~2× wider and ~2× shorter. Without `[Column.Break]`, single-column layout is used.
 
+The bottom alert list has three layouts, checked in this order:
+
 | Key | Default | Notes |
 |---|---|---|
-| `splitTriggers` | `no` | If `yes`, the bottom alerts are also split: triggers from left-column items appear bottom-left, from right-column items bottom-right. Handy when left is your buy list and right is your sell list. |
+| `alertWrapAfter` | off | Once the alert count exceeds this number, continue in a second column instead of growing taller. Splits by raw count, not buy/sell — so a lopsided burst (e.g. 20 buy alerts, 1 sell) still fills both columns instead of scrolling the table off the top of the window. Takes priority over `splitTriggers` when both are set. |
+| `splitTriggers` | `no` | If `yes` (and `alertWrapAfter` didn't kick in), triggers from left-column items appear bottom-left, from right-column items bottom-right. Handy when left is your buy list and right is your sell list — but a lopsided burst still grows one side tall on its own, since it's split by side, not by count. |
+
+If neither is set, alerts render as one plain vertical list.
 
 ```ini
 [Item.PACA]
@@ -219,7 +224,8 @@ query = PACA Soft Armor
 alert = 29000
 
 [Column.Break]
-splitTriggers = yes
+alertWrapAfter = 10   ; wrap alerts into a 2nd column past 10, regardless of side
+splitTriggers  = yes  ; fallback when alert count is under alertWrapAfter
 
 [Item.Hawk]
 query = Gunpowder "Hawk"

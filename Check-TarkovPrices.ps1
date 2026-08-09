@@ -634,11 +634,14 @@ foreach ($k in $ini.Keys) {
         else            { $leftSections.Add($k)  | Out-Null }
     }
 }
-$twoColumn     = $seenBreak
-$splitTriggers = $false
+$twoColumn      = $seenBreak
+$splitTriggers  = $false
+$alertWrapAfter = 0
 if ($twoColumn -and $ini.Contains('Column.Break')) {
     $val = $ini['Column.Break']['splitTriggers']
     if ($val) { $splitTriggers = ($val.ToString().ToLower() -in @('yes','true','1','on')) }
+    $wrapVal = $ini['Column.Break']['alertWrapAfter']
+    if ($wrapVal -match '^\d+$') { $alertWrapAfter = [int]$wrapVal }
 }
 
 # logging
@@ -688,9 +691,16 @@ if ($twoColumn) {
 try {
     if ($twoColumn) {
         $rowsPerSide = [Math]::Max($leftSections.Count, $rightSections.Count)
-        $h = [Math]::Min([Math]::Ceiling(1.4 * $rowsPerSide) + 8, [Console]::LargestWindowHeight)
+        # Reserve extra rows for the alert block below the table -- it can grow
+        # well past a couple of lines when many items trigger at once (worse
+        # yet when splitTriggers puts them all on one lopsided side). With
+        # alertWrapAfter set, that's the realistic worst case per column;
+        # otherwise reserve a generous flat amount so a burst doesn't scroll
+        # the header out of view.
+        $alertBudget = if ($alertWrapAfter -gt 0) { $alertWrapAfter } else { 15 }
+        $h = [Math]::Min([Math]::Ceiling(1.4 * $rowsPerSide) + 8 + $alertBudget, [Console]::LargestWindowHeight)
     } else {
-        $h = [Math]::Min([Math]::Ceiling(1.3 * $itemSections.Count) + $separatorSections.Count + 6, [Console]::LargestWindowHeight)
+        $h = [Math]::Min([Math]::Ceiling(1.3 * $itemSections.Count) + $separatorSections.Count + 16, [Console]::LargestWindowHeight)
     }
     $h = [Math]::Max(5, [Math]::Min($h + $windowHeightOffset, [Console]::LargestWindowHeight))
     $bufW = [Math]::Min($lineWidth + 40, [Console]::LargestWindowWidth)
@@ -984,9 +994,10 @@ try {
 
         wh ""
 
-        $alertRightCol = $colWidth + $gutterText.Length
+        $alertRightCol   = $colWidth + $gutterText.Length
+        $alertsTwoColumn = $twoColumn -and ($splitTriggers -or $alertWrapAfter -gt 0)
         if ($alerts.Count -eq 0) {
-            if ($twoColumn -and $splitTriggers) {
+            if ($alertsTwoColumn) {
                 wh "  no good deals :(" DarkGray -NoNewline
                 [Console]::CursorLeft = $alertRightCol
                 Set-DebugCursorLeft $alertRightCol
@@ -997,10 +1008,21 @@ try {
             }
         }
         else {
-            if ($twoColumn -and $splitTriggers) {
+            $leftAlerts = $null
+            if ($twoColumn -and $alertWrapAfter -gt 0 -and $alerts.Count -gt $alertWrapAfter) {
+                # Wrap by raw count, not buy/sell direction -- a lopsided burst
+                # (e.g. all triggers on the buy side) still fills both columns
+                # instead of growing one column past the console window.
+                $leftAlerts  = @($alerts | Select-Object -First $alertWrapAfter)
+                $rightAlerts = @($alerts | Select-Object -Skip  $alertWrapAfter)
+            }
+            elseif ($twoColumn -and $splitTriggers) {
                 $leftAlerts  = @($alerts | Where-Object { $leftSections.Contains($_.Section) })
                 $rightAlerts = @($alerts | Where-Object { $rightSections.Contains($_.Section) })
-                $maxAlerts   = [Math]::Max($leftAlerts.Count, $rightAlerts.Count)
+            }
+
+            if ($leftAlerts) {
+                $maxAlerts = [Math]::Max($leftAlerts.Count, $rightAlerts.Count)
                 for ($i = 0; $i -lt $maxAlerts; $i++) {
                     if ($i -lt $leftAlerts.Count)  { Write-Alert $leftAlerts[$i]  -NoNewline }
                     [Console]::CursorLeft = $alertRightCol
