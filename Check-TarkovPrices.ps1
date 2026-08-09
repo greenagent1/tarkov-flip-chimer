@@ -666,12 +666,16 @@ foreach ($k in $ini.Keys) {
     }
 }
 $twoColumn      = $seenBreak
+# Alert layout applies symmetrically to both the buy and sell side -- it
+# lives in [General], not [Column.Break], so it doesn't read as "settings
+# for the right column". Only meaningful (and only takes effect) once
+# [Column.Break] enables two-column mode.
 $splitTriggers  = $false
 $alertWrapAfter = 0
-if ($twoColumn -and $ini.Contains('Column.Break')) {
-    $val = $ini['Column.Break']['splitTriggers']
+if ($twoColumn) {
+    $val = $general['splitTriggers']
     if ($val) { $splitTriggers = ($val.ToString().ToLower() -in @('yes','true','1','on')) }
-    $wrapVal = $ini['Column.Break']['alertWrapAfter']
+    $wrapVal = $general['alertWrapAfter']
     if ($wrapVal -match '^\d+$') { $alertWrapAfter = [int]$wrapVal }
 }
 

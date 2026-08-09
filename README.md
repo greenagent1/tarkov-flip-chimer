@@ -67,6 +67,8 @@ For context: [RatScanner](https://ratscanner.com) overlays real-time item data d
 | `windowHeightOffset` | `0` | Adjust auto-computed console window height in rows. Negative shrinks (e.g. `-7`), positive grows (e.g. `+3`). |
 | `debug` | `no` | `yes` mirrors every rendered frame (table + alerts, no colors) to `debugFile` — useful for diagnosing bad data or misaligned columns without needing to screenshot the console |
 | `debugFile` | `analytics/debug-console.txt` | Path for the debug mirror log (relative to the script folder) |
+| `alertWrapAfter` | off | Two-column mode only (see `[Column.Break]`). Applies symmetrically to both the buy and sell side — see below |
+| `splitTriggers` | `no` | Two-column mode only. Applies symmetrically to both sides — see below |
 
 ### `[Item.<Label>]`
 
@@ -207,9 +209,9 @@ color = #8B6914
 
 ### `[Column.Break]`
 
-Optional. If present, splits the output into two side-by-side columns separated by a vertical bar (`│`) — sections above this line render in the left column, sections below render in the right. Useful when the item list is long: window becomes ~2× wider and ~2× shorter. Without `[Column.Break]`, single-column layout is used.
+Optional. If present, splits the output into two side-by-side columns separated by a vertical bar (`│`) — sections above this line render in the left column, sections below render in the right. Useful when the item list is long: window becomes ~2× wider and ~2× shorter. Without `[Column.Break]`, single-column layout is used. This section holds no keys of its own — its presence (and position in the file) is what triggers two-column mode.
 
-The bottom alert list has three layouts, checked in this order:
+The bottom alert list's layout is controlled by `alertWrapAfter` and `splitTriggers` in **`[General]`**, not here — they describe the alert list as a whole and apply symmetrically to both the buy and sell side, so they don't belong to "the right column". They only take effect once `[Column.Break]` is present. Checked in this order:
 
 | Key | Default | Notes |
 |---|---|---|
@@ -219,14 +221,17 @@ The bottom alert list has three layouts, checked in this order:
 If neither is set, alerts render as one plain vertical list.
 
 ```ini
+[General]
+apiKey         = YOUR_API_KEY_HERE
+alertWrapAfter = 10    ; buy alerts left, sell alerts right; each side wraps
+                       ; into its own sub-column(s) past 10 rows
+splitTriggers  = yes   ; fallback while alert counts are under alertWrapAfter
+
 [Item.PACA]
 query = PACA Soft Armor
 alert = 29000
 
 [Column.Break]
-alertWrapAfter = 10   ; buy alerts left, sell alerts right; each side wraps
-                       ; into its own sub-column(s) past 10 rows
-splitTriggers  = yes   ; fallback while alert counts are under alertWrapAfter
 
 [Item.Hawk]
 query = Gunpowder "Hawk"
