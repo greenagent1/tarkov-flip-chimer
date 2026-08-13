@@ -89,6 +89,30 @@ For context: [RatScanner](https://ratscanner.com) overlays real-time item data d
 | `S45000` | Sell when price > 45 000 ₽ |
 | `B15%` | Buy when price is more than 15% below `avgSource` |
 | `S7%` | Sell when price is more than 7% above `avgSource` |
+| `Bp10` | Buy when the price lands in the cheapest 10% relative to `avgSource` over the recent window |
+| `Sp90` | Sell when the price lands in the priciest 10% |
+
+**Rolling thresholds (`p` form)**
+
+A fixed percentage is pinned to whatever the item looked like when you calibrated it. Once the
+price starts drifting — fresh wipe, an item bleeding down for weeks or ramping up — the threshold
+goes stale: the alert either never clears or never fires.
+
+`Bp10` takes the 10th percentile of the price's deviation from `avgSource` over the item's own
+recent history and recomputes it every cycle, so the alert rate stays at what you asked for
+regardless of drift.
+
+History is seeded from the log (`[Logging] path`) at startup and kept in memory afterwards. The
+window is configured in `[General]`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `historyPoints` | `60` | how many recent **price changes** to keep per item |
+| `historyMaxDays` | `7` | and no older than this many days |
+| `historyMinObs` | `20` | below this the item never triggers and shows `p10 14/20` in the Target column |
+
+Only price changes count: an offer that sits unchanged for an hour would otherwise dominate the
+whole distribution.
 
 #### Same item, two directions
 
