@@ -217,6 +217,106 @@ function Format-Price {
     return '{0:N0}' -f $Value
 }
 
+function Get-RefAvg {
+    # Якорь, от которого считается diff и порог: avg24h | avg7d | вес 0..1
+    # между ними | фиксированная цена числом.
+    param([string]$AvgSource, [long]$Avg24h, [long]$Avg7d)
+    if     ($AvgSource -eq 'avg24h') { return [long]$Avg24h }
+    elseif ($AvgSource -eq 'avg7d')  { return [long]$Avg7d  }
+    elseif ($AvgSource -match '^-?\d+\.\d+$') {
+        $w = [double]::Parse($AvgSource, [System.Globalization.CultureInfo]::InvariantCulture)
+        return [long]($Avg7d + $w * ($Avg24h - $Avg7d))
+    }
+    elseif ($AvgSource -match '^\d+$') { return [long]$AvgSource }
+    return $null
+}
+
+# ── скользящая история цен: основа для перцентильных порогов ──────────────
+# Фиксированный процент от среднего живёт ровно до тех пор, пока предмет не
+# начал дрейфовать вайпом: на майском логе (53 предмета, 23 дня) он уезжает
+# от заданной частоты алертов на 9.2 п.п. и в четверти предмето-недель либо
+# молчит, либо не выключается. Перцентиль по собственной недавней истории
+# предмета держит 3.9 п.п. и переживает дрейф в обе стороны, потому что
+# распределение пересчитывается на свежем окне.
+$script:priceHistory = @{}      # label -> List[{ price; avg24h; avg7d; t }]
+$script:histPoints   = 60       # сколько последних СМЕН цены держим
+$script:histMaxDays  = 7        # и не старше стольких суток
+$script:histMinObs   = 20       # меньше — перцентилю верить нельзя
+
+function Add-PriceObservation {
+    param([string]$Label, [long]$Price, [long]$Avg24h, [long]$Avg7d, [datetime]$Time)
+    if (-not $Label -or $Price -le 0) { return }
+    $h = $script:priceHistory[$Label]
+    if (-not $h) {
+        $h = New-Object 'System.Collections.Generic.List[object]'
+        $script:priceHistory[$Label] = $h
+    }
+    # только смены цены: залипший на час оффер иначе перевесит весь перцентиль
+    if ($h.Count -gt 0 -and $h[$h.Count - 1].price -eq $Price) { return }
+    $h.Add([PSCustomObject]@{ price = $Price; avg24h = $Avg24h; avg7d = $Avg7d; t = $Time })
+    $cutoff = $Time.AddDays(-$script:histMaxDays)
+    while ($h.Count -gt 0 -and $h[0].t -lt $cutoff) { $h.RemoveAt(0) }
+    while ($h.Count -gt $script:histPoints)         { $h.RemoveAt(0) }
+}
+
+function Get-PercentileMinObs {
+    # Сколько точек нужно, чтобы перцентиль вообще что-то значил: требуем не
+    # меньше двух наблюдений в самом хвосте. Для p10 это 20 точек, для p5 — 40.
+    # Иначе «порог» — это просто минимум окна, и он скачет от каждой сделки.
+    param([double]$Percentile)
+    $tail = [Math]::Min($Percentile, 100.0 - $Percentile)
+    if ($tail -le 0) { return [int]::MaxValue }
+    return [Math]::Max($script:histMinObs, [int][Math]::Ceiling(200.0 / $tail))
+}
+
+function Get-ResidualPercentile {
+    # p-й перцентиль отклонения цены от якоря по истории самого предмета.
+    # Отклонение, а не цена: сырая цена в тренде даёт «дешевле всего за неделю»
+    # каждый день подряд, отклонение от avg24h тренд снимает.
+    param([string]$Label, [double]$Percentile, [string]$AvgSource)
+    $need = Get-PercentileMinObs -Percentile $Percentile
+    $h = $script:priceHistory[$Label]
+    if (-not $h -or $h.Count -lt $need) { return $null }
+    $vals = New-Object 'System.Collections.Generic.List[double]'
+    foreach ($o in $h) {
+        $ref = Get-RefAvg -AvgSource $AvgSource -Avg24h $o.avg24h -Avg7d $o.avg7d
+        if ($ref -and $ref -gt 0) { $vals.Add((($o.price - $ref) / $ref) * 100.0) }
+    }
+    if ($vals.Count -lt $need) { return $null }
+    $sorted = @($vals | Sort-Object)
+    $k = ($sorted.Count - 1) * $Percentile / 100.0
+    $f = [int][Math]::Floor($k)
+    $c = [Math]::Min($f + 1, $sorted.Count - 1)
+    return $sorted[$f] + ($sorted[$c] - $sorted[$f]) * ($k - $f)
+}
+
+function Initialize-PriceHistory {
+    # Засев истории из лога, чтобы перцентили работали сразу после старта,
+    # а не через час набора. Читаем только хвост: старше histMaxDays всё
+    # равно отбрасывается, а лог легко вырастает до десятков мегабайт.
+    param([string]$Path, [int]$TailLines = 1200)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return 0 }
+    try   { $lines = @(Get-Content -LiteralPath $Path -Tail $TailLines -ErrorAction Stop) }
+    catch { return 0 }
+    $n = 0
+    foreach ($line in $lines) {
+        if (-not $line -or -not $line.Trim()) { continue }
+        try {
+            $e = $line | ConvertFrom-Json -ErrorAction Stop
+            $t = [datetimeoffset]::Parse([string]$e.time,
+                    [System.Globalization.CultureInfo]::InvariantCulture).LocalDateTime
+        }
+        catch { continue }
+        foreach ($it in $e.items) {
+            if ($null -eq $it.currentPrice) { continue }
+            Add-PriceObservation -Label ([string]$it.label) -Price ([long]$it.currentPrice) `
+                -Avg24h ([long]$it.avg24h) -Avg7d ([long]$it.avg7d) -Time $t
+        }
+        $n++
+    }
+    return $n
+}
+
 function Format-UpdatedAgo {
     param($UpdatedField)
     if (-not $UpdatedField) { return '' }
@@ -245,18 +345,27 @@ function Format-UpdatedAgo {
     catch { return '' }
 }
 
+$script:lastBulkError = $null
+
 function Get-TarkovItemsAll {
-    param([string]$ApiKey, [string]$GameMode)
+    param([string]$ApiKey, [string]$GameMode, [int]$TimeoutSec = 30)
     $prefix = switch ($GameMode) {
         'pve'  { 'pve/' }
         'pvps' { 'season/' }
         default { '' }
     }
     $uri = "https://api.tarkov-market.app/api/v1/${prefix}items/all"
+    $script:lastBulkError = $null
     try {
-        return Invoke-RestMethod -Uri $uri -Headers @{ 'x-api-key' = $ApiKey } -Method Get -ErrorAction Stop
+        # -TimeoutSec is load-bearing: Invoke-RestMethod's default is an
+        # *indefinite* timeout, so one silently dead keep-alive socket (VPN
+        # rehandshake, resumed laptop) blocks the loop forever -- the last
+        # frame just sits on screen and the tool looks alive but frozen.
+        return Invoke-RestMethod -Uri $uri -Headers @{ 'x-api-key' = $ApiKey } `
+                                 -Method Get -TimeoutSec $TimeoutSec -ErrorAction Stop
     }
     catch {
+        $script:lastBulkError = $_.Exception.Message
         Write-Warning "  Bulk API error: $_"
         return $null
     }
@@ -387,6 +496,15 @@ function Find-TarkovItemLocal {
         Write-Warning "  No results for: $Query"
         return $null
     }
+    # An exact name/shortName hit beats the longer names it is a substring of:
+    # "Rye croutons" must not silently resolve to "Emelya rye croutons" just
+    # because that one happens to be pricier this hour (the caller tie-breaks
+    # by price). Same for ComTac VI vs "TW EXFIL Peltor ComTac VI headset".
+    $exact = @($found | Where-Object {
+        ($_.name      -and $_.name.ToLower()      -eq $q) -or
+        ($_.shortName -and $_.shortName.ToLower() -eq $q)
+    })
+    if ($exact.Count -gt 0) { return $exact }
     return $found
 }
 
@@ -491,8 +609,8 @@ function Write-ItemRow {
         wh ("{0,$wTarget}" -f (Format-Price $r.targetPrice)) $r.targetColor -NoNewline
         wh " $rub   " DarkGray -NoNewline
     } else {
-        wh ("{0,$wTarget}" -f '') -NoNewline
-        wh "      " -NoNewline
+        wh ("{0,$wTarget}" -f [string]$r.targetNote) DarkGray -NoNewline
+        wh "     " -NoNewline          # ровно как " $rub   " в ветке выше, иначе колонка съедет
     }
     wh ("{0,$wDiff}" -f $r.diffLabel) $r.diffColor -NoNewline
     wh "    " -NoNewline
@@ -590,6 +708,9 @@ $dash = ([string][char]0x2500)
 $general = $ini['General']
 $apiKey  = $general['apiKey']
 if ($general['checkIntervalSecs']) { $checkIntervalSec = [int]$general['checkIntervalSecs'] } else { $checkIntervalSec = 300 }
+# Cap one fetch well below the cycle so a stalled request can't eat the interval;
+# a failed cycle renders the error and retries on the next tick.
+$fetchTimeoutSec = [Math]::Max(10, [Math]::Min(45, $checkIntervalSec - 5))
 $soundFileRel = if ($general['soundFile']) { $general['soundFile'] } else { 'alert.wav' }
 $soundFile    = Join-Path $scriptDir $soundFileRel
 $volumeRaw    = $general['volume']
@@ -598,6 +719,11 @@ $volume = [Math]::Max(0, [Math]::Min(100, $v))
 
 $windowHeightOffset = 0
 if ($general['windowHeightOffset'] -match '^-?\d+$') { $windowHeightOffset = [int]$general['windowHeightOffset'] }
+
+# окно скользящих (перцентильных) порогов
+if ($general['historyPoints']  -match '^\d+$') { $script:histPoints  = [int]$general['historyPoints'] }
+if ($general['historyMaxDays'] -match '^\d+$') { $script:histMaxDays = [int]$general['historyMaxDays'] }
+if ($general['historyMinObs']  -match '^\d+$') { $script:histMinObs  = [int]$general['historyMinObs'] }
 
 $debugVal = $general['debug']
 $script:debugEnabled = ($debugVal -and ($debugVal.ToString().ToLower() -in @('yes','true','1','on')))
@@ -701,6 +827,14 @@ if ($ini.Contains('Logging')) {
     }
 }
 
+# Засев скользящих порогов историей из лога — иначе после каждого рестарта
+# перцентили молчали бы, пока не наберётся histMinObs смен цены.
+$seededCycles = 0
+if ($logEnabled -and ($ini.Keys | Where-Object { $_ -match '^Item\.' } |
+        ForEach-Object { $ini[$_]['alert'] } | Where-Object { $_ -match '^[BSbs]?[pP]\d' })) {
+    $seededCycles = Initialize-PriceHistory -Path $logPath
+}
+
 # column widths
 $wLabel  = 20
 $wPrice  = 12
@@ -748,8 +882,44 @@ try {
 
 Disable-ConsoleQuickEdit
 
+function Write-HeaderClock {
+    # Живые часы в шапке: перерисовываются раз в секунду всё время ожидания.
+    # Это и есть индикатор «не завис»: если цикл встанет где угодно — на сети,
+    # на звуке, на заблокированном выводе консоли — часы замрут вместе с ним,
+    # и это видно сразу, а не через восемь часов по дыре в логе.
+    param([string]$Base, [int]$SecondsLeft, [int]$CycleNo, [string]$Suffix = '')
+    try {
+        $w = [Console]::WindowWidth
+        if ($w -lt 20) { return }
+        $line = "$Base | " + (Get-Date -Format 'HH:mm:ss') + " · next ${SecondsLeft}s · cycle $CycleNo"
+        if ($Suffix) { $line += " · $Suffix" }
+        $line += ' | Ctrl+C'
+        if ($line.Length -gt $w - 1) { $line = $line.Substring(0, $w - 1) }
+        $l0 = [Console]::CursorLeft
+        $t0 = [Console]::CursorTop
+        [Console]::SetCursorPosition(0, 0)
+        Write-Host $line.PadRight($w - 1) -ForegroundColor DarkGray -NoNewline
+        [Console]::SetCursorPosition($l0, $t0)
+    }
+    catch { }
+}
+
+function Wait-Cycle {
+    param([int]$Seconds, [string]$Base, [int]$CycleNo, [string]$Suffix = '')
+    $end = (Get-Date).AddSeconds($Seconds)
+    while ($true) {
+        $left = [int][Math]::Ceiling(($end - (Get-Date)).TotalSeconds)
+        if ($left -lt 0) { $left = 0 }
+        Write-HeaderClock -Base $Base -SecondsLeft $left -CycleNo $CycleNo -Suffix $Suffix
+        if ($left -le 0) { break }
+        Start-Sleep -Milliseconds 1000
+    }
+}
+
 $lastAlertedPrice = @{}
 $lastPrices       = @{}
+$cycleNo          = 0
+$lastDataStamp    = '--:--:--'
 
 # ─── main loop ────────────────────────────────────────────────────────────────
 try {
@@ -761,6 +931,8 @@ try {
         $fetchError    = $null
         $firstCycle    = ($lastPrices.Count -eq 0)
         $anyChanged    = $false
+        $cycleObs      = @{}
+        $cycleNo++
 
         # ── compute phase: fetch + per-section work, no console output ────
         $allItems  = $null
@@ -787,9 +959,14 @@ try {
         }
 
         if (-not $fetchError -and -not $useFree) {
-            $allItems = Get-TarkovItemsAll -ApiKey $apiKey -GameMode $gameMode
+            $allItems = Get-TarkovItemsAll -ApiKey $apiKey -GameMode $gameMode -TimeoutSec $fetchTimeoutSec
             if ($null -eq $allItems) {
                 $fetchError = 'bulk fetch failed, retrying next cycle'
+                if ($script:lastBulkError) {
+                    $why = $script:lastBulkError -replace '\s+', ' '
+                    if ($why.Length -gt 90) { $why = $why.Substring(0, 90) + '...' }
+                    $fetchError = "bulk fetch failed ($why), retrying next cycle"
+                }
             }
         }
 
@@ -864,23 +1041,32 @@ try {
                 $avg24h = [long]$apiItem.avg24hPrice
                 $avg7d  = [long]$apiItem.avg7daysPrice
 
-                $refAvg = $null
-                if     ($avgSource -eq 'avg24h')   { $refAvg = $avg24h }
-                elseif ($avgSource -eq 'avg7d')    { $refAvg = $avg7d }
-                elseif ($avgSource -match '^-?\d+\.\d+$') {
-                    $w = [double]::Parse($avgSource, [System.Globalization.CultureInfo]::InvariantCulture)
-                    $refAvg = [long]($avg7d + $w * ($avg24h - $avg7d))
-                }
-                elseif ($avgSource -match '^\d+$') { $refAvg = [long]$avgSource }
+                $refAvg = Get-RefAvg -AvgSource $avgSource -Avg24h $avg24h -Avg7d $avg7d
 
                 $diffVal   = if ($refAvg -and $refAvg -gt 0) { ($currentPrice - $refAvg) / $refAvg * 100.0 } else { $null }
                 $diffLabel = if ($null -ne $diffVal)         { '{0:+0.0;-0.0}%' -f $diffVal }                else { '' }
 
-                $isPercent   = $alertVal -match '^(\d+(?:\.\d+)?)%$'
                 $triggered   = $false
                 $targetPrice = $null
+                $targetNote  = ''
 
-                if ($isPercent) {
+                if ($alertVal -match '^[pP](\d+(?:\.\d+)?)$') {
+                    # Скользящий порог: alert = Bp10 значит «цена в 10% самых
+                    # дешёвых относительно якоря за последнее окно».
+                    $q  = [double]$Matches[1]
+                    $pv = Get-ResidualPercentile -Label $label -Percentile $q -AvgSource $avgSource
+                    if ($null -eq $pv -or -not $refAvg -or $refAvg -le 0) {
+                        $have = 0
+                        if ($script:priceHistory[$label]) { $have = $script:priceHistory[$label].Count }
+                        $targetNote = "p$([int]$q) $have/$(Get-PercentileMinObs -Percentile $q)"
+                    }
+                    else {
+                        $targetPrice = [long]($refAvg * (1.0 + $pv / 100.0))
+                        if ($direction -eq 'B') { $triggered = $currentPrice -lt $targetPrice }
+                        else                    { $triggered = $currentPrice -gt $targetPrice }
+                    }
+                }
+                elseif ($alertVal -match '^(\d+(?:\.\d+)?)%$') {
                     $pct = [double]$Matches[1]
                     if ($direction -eq 'B') {
                         $targetPrice = [long]($refAvg * (1.0 - $pct / 100.0))
@@ -896,6 +1082,11 @@ try {
                     if ($direction -eq 'B') { $triggered = $currentPrice -lt $targetPrice }
                     else                    { $triggered = $currentPrice -gt $targetPrice }
                 }
+
+                # Наблюдение копим отдельно и вливаем после цикла: иначе Buy-секция
+                # считала бы перцентиль без текущей точки, а Sell-секция того же
+                # предмета — уже с ней.
+                $cycleObs[$label] = @{ price = $currentPrice; avg24h = $avg24h; avg7d = $avg7d }
 
                 $targetOverride = $cfg['target']
                 if ($targetOverride -and $targetOverride -match '^\d+$') {
@@ -927,6 +1118,7 @@ try {
                     currentPrice = $currentPrice
                     priceColor   = $priceColor
                     targetPrice  = $targetPrice
+                    targetNote   = $targetNote
                     targetColor  = $targetColor
                     diffLabel    = $diffLabel
                     diffColor    = $diffColor
@@ -958,6 +1150,15 @@ try {
             }
         }
 
+        # ── history phase: одна точка на предмет за цикл, после всех секций ──
+        if (-not $fetchError) {
+            $now = Get-Date
+            foreach ($kv in $cycleObs.GetEnumerator()) {
+                Add-PriceObservation -Label $kv.Key -Price ([long]$kv.Value.price) `
+                    -Avg24h ([long]$kv.Value.avg24h) -Avg7d ([long]$kv.Value.avg7d) -Time $now
+            }
+        }
+
         # ── log phase: append JSON line if data changed (or first cycle) ──
         if ($logEnabled -and -not $fetchError -and ($firstCycle -or $anyChanged)) {
             Write-PriceLogEntry -Path $logPath -Clock $timestamp `
@@ -967,7 +1168,9 @@ try {
         # ── render phase: clear screen, print everything in one burst ───
         [Console]::Clear()
         Reset-DebugFrame
-        wh "Tarkov Price Alert | $apiLabel | $($itemSections.Count) items | every ${checkIntervalSec}s | Ctrl+C to stop" DarkGray
+        $headerBase = "Tarkov Price Alert | $apiLabel | $($itemSections.Count) items"
+        if (-not $fetchError) { $lastDataStamp = $timestamp }
+        wh "$headerBase | every ${checkIntervalSec}s | Ctrl+C" DarkGray
 
         $mid   = " $timestamp "
         $sides = [Math]::Floor(($lineWidth - $mid.Length) / 2)
@@ -977,7 +1180,7 @@ try {
             wh ""
             wh "  $fetchError" DarkGray
             Complete-DebugFrame -Timestamp $timestamp
-            Start-Sleep -Seconds $checkIntervalSec
+            Wait-Cycle -Seconds $checkIntervalSec -Base $headerBase -CycleNo $cycleNo -Suffix "data $lastDataStamp"
             continue
         }
 
@@ -1100,7 +1303,7 @@ try {
             }
         }
         Complete-DebugFrame -Timestamp $timestamp
-        Start-Sleep -Seconds $checkIntervalSec
+        Wait-Cycle -Seconds $checkIntervalSec -Base $headerBase -CycleNo $cycleNo -Suffix "data $lastDataStamp"
     }
 }
 finally {
